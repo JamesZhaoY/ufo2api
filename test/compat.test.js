@@ -1,6 +1,12 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),compat=require('../compat');
 const tool={type:'function',function:{name:'get_weather',description:'weather',parameters:{type:'object',properties:{city:{type:'string'}},required:['city']}}};
+test('early tool-name hints must match the fully validated first call',()=>{
+ const response={tool_name:'get_weather',tool_calls:[{name:'get_weather',arguments:{city:'Paris'}}],content:null};assert.equal(compat.parseResult(JSON.stringify(response),{tools:[tool]}).tool_calls.length,1);
+ assert.throws(()=>compat.parseResult(JSON.stringify({...response,tool_name:'other'}),{tools:[tool]}),/不一致/);
+ assert.throws(()=>compat.parseResult('{"tool_name":"get_weather","tool_calls":[],"content":"x"}',{tools:[tool]}),/不一致/);
+ assert.equal(compat.parseResult('{"tool_name":null,"tool_calls":[],"content":"hello"}',{tools:[tool]}).content,'hello');
+});
 
 test('prose followed by a tool-call envelope still produces an executable call',()=>{
  const ask={type:'function',function:{name:'ask_user_question',parameters:{type:'object',properties:{questions:{type:'array',items:{type:'object',properties:{id:{type:'string'},question:{type:'string'}},required:['id','question']}}},required:['questions']}}};

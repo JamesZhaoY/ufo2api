@@ -274,7 +274,7 @@ const server=http.createServer(async(req,res)=>{
    completedMessage=message;
    const finish=calls.length?(legacy?'function_call':'tool_calls'):'stop';timings.toolCallsReturned=calls.length;timings.finishReason=finish;
    if (body.stream) {
-    if(callStream?.started){emitDelta({tool_calls:[{index:0,function:{arguments:'}'}}]});if(calls.length>1)emitDelta({tool_calls:calls.slice(1).map((call,index)=>({index:index+1,...call}))});}
+    if(callStream?.started){emitDelta({tool_calls:[{index:0,function:{arguments:callStream.argumentsStarted?'}':calls[0].function.arguments}}]});if(calls.length>1)emitDelta({tool_calls:calls.slice(1).map((call,index)=>({index:index+1,...call}))});}
     if(catalogStreamed&&parsed.content?.length>catalogStreamed.length)emitContent(parsed.content.slice(catalogStreamed.length));
     if(toolStreamed&&parsed.content?.length>toolStreamed.length)emitContent(parsed.content.slice(toolStreamed.length));
     if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;
