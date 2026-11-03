@@ -1,0 +1,9 @@
+.ufo/
+node_modules/
+bin/
+__pycache__/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

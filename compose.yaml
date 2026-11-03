@@ -1,0 +1,16 @@
+services:
+  ufo:
+    build: .
+    init: true
+    restart: unless-stopped
+    environment:
+      UFO_HOME: /data
+      UFO_PROXY_HOST: 0.0.0.0
+      UFO_PROXY_PORT: 8787
+      UFO_PUBLIC_ORIGIN: ${UFO_PUBLIC_ORIGIN:-http://127.0.0.1:8787}
+    ports:
+      - "${UFO_BIND_ADDRESS:-127.0.0.1}:${UFO_HOST_PORT:-8787}:8787"
+    volumes:
+      - ufo_data:/data
+volumes:
+  ufo_data:

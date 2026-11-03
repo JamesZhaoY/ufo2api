@@ -1,0 +1,8 @@
+.ufo
+node_modules
+.git
+.env
+.env.*
+.DS_Store
+test
+*.log

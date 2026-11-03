@@ -1,0 +1,53 @@
+'use strict';
+const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
+const accounts=require('./accounts');
+const stateCache=require('./state-cache');
+const SETTINGS=path.join(accounts.HOME,'settings.json');
+const defaults={strategy:'round_robin',sticky:true,sticky_minutes:60};
+const strategies=new Set(['quota','random','round_robin']);
+const quotaInflight=new Map(),stickyMap=new Map(),sessionLocks=new Map();let cursor=0;
+function settings(){if(!fs.existsSync(SETTINGS))return {...defaults};const x=JSON.parse(fs.readFileSync(SETTINGS,'utf8'));return normalize(x);}
+function normalize(x){if(!x||!strategies.has(x.strategy)||typeof x.sticky!=='boolean'||!Number.isInteger(x.sticky_minutes)||x.sticky_minutes<1||x.sticky_minutes>1440)throw Error('无效的账号池设置');return {strategy:x.strategy,sticky:x.sticky,sticky_minutes:x.sticky_minutes};}
+function saveSettings(x){const s=normalize(x);fs.mkdirSync(accounts.HOME,{recursive:true,mode:0o700});const tmp=path.join(accounts.HOME,'.settings-'+crypto.randomUUID());try{fs.writeFileSync(tmp,JSON.stringify(s,null,2)+'\n',{mode:0o600,flag:'wx'});fs.renameSync(tmp,SETTINGS);}finally{try{fs.unlinkSync(tmp)}catch{}}if(!s.sticky)stickyMap.clear();return s;}
+async function quota(account,refresh=false){
+ const key=account.id+':'+stateCache.fingerprint(account);const saved=stateCache.get(account,'quota');if(!refresh){if(!saved&&quotaInflight.has(key))return quotaInflight.get(key);return saved||{status:'unknown',balance_micro_usd:null,refused_below_micro_usd:null,checkedAt:null,error:'尚未获取，请手动刷新'};}
+ if(quotaInflight.has(key))return quotaInflight.get(key);
+ const promise=(async()=>{let q;try{const r=await fetch(account.workspace+'/ext/metronome/billing',{headers:{cookie:'ufo_session='+account.token,accept:'application/json'},...accounts.options(account.proxy),signal:AbortSignal.timeout(30000)});if(!r.ok)throw Error('HTTP '+r.status);const b=await r.json();if(typeof b.limited!=='boolean')throw Error('额度响应格式异常');
+  if(b.limited && (!Number.isFinite(b.balance_micro_usd)||!Number.isFinite(b.refused_below_micro_usd)))throw Error('额度数据不完整');
+  q={status:b.limited?(b.balance_micro_usd<=b.refused_below_micro_usd?'exhausted':'available'):'no_limit',balance_micro_usd:Number.isFinite(b.balance_micro_usd)?b.balance_micro_usd:null,refused_below_micro_usd:Number.isFinite(b.refused_below_micro_usd)?b.refused_below_micro_usd:null,checkedAt:Date.now()};
+ }catch(e){const reason=e.name==='TimeoutError'?'查询超时':e.message;q=saved?{...saved,refreshError:reason}:{status:'unknown',balance_micro_usd:null,refused_below_micro_usd:null,checkedAt:null,error:reason};}stateCache.put(account,'quota',q);return q;})().finally(()=>quotaInflight.delete(key));quotaInflight.set(key,promise);return promise;
+}
+function workspaceKey(account){try{const c=JSON.parse(Buffer.from(account.token.split('.')[0],'base64url'));return typeof c.ws==='string'&&c.ws?crypto.createHash('sha256').update(account.workspace+'\0'+c.ws).digest('hex'):null;}catch{return null;}}
+async function quotaList(refresh=false){const all=accounts.read().accounts;const result=[];for(let i=0;i<all.length;i+=8){const batch=await Promise.all(all.slice(i,i+8).map(async a=>({id:a.id,workspaceKey:workspaceKey(a),...await quota(a,refresh)})));result.push(...batch);}return result;}
+function conversationKey(body,header){if(header){if(typeof header!=='string'||header.length>256||/[\r\n]/.test(header))throw Error('无效的 X-Conversation-ID');return 'explicit:'+header;}const first=body.messages.find(m=>m.role==='user');if(!first)return null;const leading=body.messages.slice(0,body.messages.indexOf(first)).filter(m=>m.role==='system'||m.role==='developer');return 'history:'+JSON.stringify([...leading,first]);}
+function rankedQuota(q){if(q.status==='available')return q.balance_micro_usd-q.refused_below_micro_usd;return -Infinity;}
+function choose(candidates,opts,key,now=Date.now()){
+ if(!candidates.length)throw Error('没有可用的账号');
+ for(const [k,v] of stickyMap)if(v.expires<=now)stickyMap.delete(k);
+ const hash=key?crypto.createHash('sha256').update(key).digest('hex'):null;
+ if(opts.sticky && hash && stickyMap.has(hash)){
+  const pin=stickyMap.get(hash);const match=candidates.find(c=>c.account.id===pin.id && c.quota.status!=='exhausted');if(!match)throw Error('粘性会话绑定的账号当前不可用，请检查额度或更换会话 ID');pin.expires=now+opts.sticky_minutes*60000;return match.account;
+ }
+ const eligible=candidates.filter(x=>x.quota.status!=='exhausted');if(!eligible.length)throw Error('所有账号的可用额度均已耗尽');
+ let chosen;if(opts.strategy==='quota'){const ranked=eligible.filter(x=>x.quota.status==='available');chosen=(ranked.length?ranked:eligible).reduce((best,x)=>rankedQuota(x.quota)>rankedQuota(best.quota)?x:best);}
+ else if(opts.strategy==='random')chosen=eligible[crypto.randomInt(eligible.length)];
+ else{chosen=eligible[cursor%eligible.length];cursor=(cursor+1)%2147483647;}
+ if(opts.sticky && hash){if(stickyMap.size>=10000)stickyMap.delete(stickyMap.keys().next().value);stickyMap.set(hash,{id:chosen.account.id,expires:now+opts.sticky_minutes*60000});}
+ return chosen.account;
+}
+async function chooseSupported(candidates,opts,key,isSupported){
+ const hash=opts.sticky&&key?crypto.createHash('sha256').update(key).digest('hex'):null;
+ const run=async()=>{
+  const pinned=hash&&stickyMap.get(hash);const existing=!!(pinned&&pinned.expires>Date.now());let remaining=candidates.slice();
+  while(remaining.length){const chosen=choose(remaining,opts,key);const supported=await isSupported(chosen);if(supported)return chosen;
+   if(existing)throw Error('粘性会话绑定的账号不支持该模型或模型列表不可用');
+   if(hash&&stickyMap.get(hash)?.id===chosen.id)stickyMap.delete(hash);
+   remaining=remaining.filter(c=>c.account.id!==chosen.id);
+  }
+  throw Error('没有可确认支持该模型的账号，请检查模型列表或网络。');
+ };
+ if(!hash)return run();
+ const previous=sessionLocks.get(hash)||Promise.resolve();let release;const current=new Promise(r=>{release=r});sessionLocks.set(hash,current);
+ await previous;try{return await run();}finally{release();if(sessionLocks.get(hash)===current)sessionLocks.delete(hash);}
+}
+module.exports={settings,saveSettings,quota,quotaList,conversationKey,choose,chooseSupported};

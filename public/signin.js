@@ -1,0 +1,4 @@
+'use strict';
+const form=document.querySelector('#signin-form'),input=document.querySelector('#password'),error=document.querySelector('#error'),button=document.querySelector('#submit'),toggle=document.querySelector('#show-password');
+toggle.addEventListener('click',()=>{input.type=input.type==='password'?'text':'password';toggle.textContent=input.type==='password'?'显示':'隐藏';toggle.setAttribute('aria-label',input.type==='password'?'显示密码':'隐藏密码');});
+form.addEventListener('submit',async e=>{e.preventDefault();button.disabled=true;error.hidden=true;try{const r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json','X-UFO-UI':'1'},body:JSON.stringify({password:input.value})});const result=await r.json();if(!r.ok)throw Error(result.error?.message||'登录失败');input.value='';location.replace('/');}catch(err){error.textContent=err.message;error.hidden=false;input.value='';input.focus();}finally{button.disabled=false;}});
