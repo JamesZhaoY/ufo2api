@@ -14,6 +14,8 @@ const {CatalogTextStream,ToolTextStream}=require('./catalog-stream');
 const auth = require('./auth');
 const stateCache = require('./state-cache');
 const dashboardAuth = require('./dashboard-auth');
+const mailboxes = require('./mailboxes');
+const mailboxJobsModule = require('./mailbox-jobs');
 
 const ROOT = __dirname;
 const HOME = process.env.UFO_HOME || path.join(ROOT, '.ufo');
@@ -48,6 +50,7 @@ async function getModels(account, refresh=false) {
  modelInflight.set(flightKey,pending);try{return await pending;}finally{if(modelInflight.get(flightKey)===pending)modelInflight.delete(flightKey);}
 }
 async function refreshAccount(account){return Promise.allSettled([getModels(account,true),pool.quota(account,true)]);}
+const mailboxJobs=mailboxJobsModule.create({refresh:refreshAccount});
 async function warmMissing(){const all=accounts.read().accounts;for(let i=0;i<all.length;i+=8)await Promise.all(all.slice(i,i+8).map(a=>{const jobs=[];if(!stateCache.get(a,'models'))jobs.push(getModels(a,true));if(!stateCache.get(a,'quota'))jobs.push(pool.quota(a,true));return Promise.allSettled(jobs)}));}
 async function upstream(messages, onText, signal, account=readConfig(), model=MODEL, request={}, promptOverride=null) {
  const {token,workspace:origin,proxy}=account;
@@ -112,6 +115,8 @@ async function management(req,res) {
  if(!dashboardAuth.valid(req))return fail(res,401,'请先登录控制台。','authentication_error');
  if(req.method!=='GET'&&req.headers['x-ufo-ui']!=='1')return fail(res,403,'无效的管理请求。');
  if(req.method==='GET' && req.url==='/api/accounts')return json(res,200,accounts.list());
+ if(req.method==='GET' && req.url==='/api/mailboxes')return json(res,200,{mailboxes:mailboxes.list()});
+ if(req.method==='GET' && req.url==='/api/mailboxes/jobs')return json(res,200,{jobs:mailboxJobs.list()});
  if(req.method==='GET' && req.url==='/api/activity')return json(res,200,{calls:activity.recent()});
  if(req.method==='GET' && req.url==='/api/settings'){res.setHeader('Cache-Control','no-store');return json(res,200,{...pool.settings(),apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
  if(req.method==='GET' && req.url==='/api/quotas')return json(res,200,{accounts:await pool.quotaList(false)});
@@ -121,11 +126,14 @@ async function management(req,res) {
  if(req.method!=='POST')return fail(res,404,'Not found.');
  let raw='',bytes=0;const dec=new StringDecoder('utf8');
  try{
-  for await(const part of req){bytes+=part.length;if(bytes>(req.url==='/api/accounts/import'?2097152:16384))return fail(res,413,'请求过大。');raw+=dec.write(part);}raw+=dec.end();
+  for await(const part of req){bytes+=part.length;if(bytes>(['/api/accounts/import','/api/mailboxes/import'].includes(req.url)?2097152:16384))return fail(res,413,'请求过大。');raw+=dec.write(part);}raw+=dec.end();
   const data=JSON.parse(raw||'{}');
   if(req.url==='/api/quotas/refresh')return json(res,200,{accounts:await pool.quotaList(true)});
   if(req.url==='/api/models/refresh'){const a=readConfig(),models=await getModels(a,true);return json(res,200,{models,accountId:a.id,updatedAt:stateCache.get(a,'models')?.updatedAt||null});}
   if(req.url==='/api/settings'){if(data.apiKey!==undefined){auth.valid(data.apiKey);if(KEY&&data.apiKey!==KEY)throw Error('API Key 由环境变量控制，请修改环境变量后重启');}const saved=pool.saveSettings(data);if(data.apiKey!==undefined&&!KEY&&data.apiKey!==auth.key())auth.set(data.apiKey);return json(res,200,{...saved,apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
+  if(req.url==='/api/mailboxes/import'){if(data.replace&&mailboxes.list().some(x=>mailboxJobs.busy(x.id)))throw Error('邮箱注册任务进行中，请完成后替换凭据');return json(res,200,mailboxes.importEntries(data.entries,{replace:data.replace===true}));}
+  if(req.url==='/api/mailboxes/register')return json(res,200,{jobs:mailboxJobs.start(data.ids)});
+  if(req.url==='/api/mailboxes/delete'){if(mailboxJobs.busy(data.id))throw Error('该邮箱正在注册，暂不能移除');mailboxes.remove(data.id);return json(res,200,{mailboxes:mailboxes.list()});}
   if(req.url==='/api/accounts/export'){res.setHeader('Cache-Control','no-store');return json(res,200,accounts.exportAccounts());}
   if(req.url==='/api/accounts/import'){const result=accounts.importAccounts(data);if(result.imported)void warmMissing().catch(e=>console.error('导入后加载失败:',e.message));return json(res,200,result);}
   if(req.url==='/api/accounts/select'){accounts.select(data.id);return json(res,200,accounts.list());}
@@ -166,7 +174,7 @@ const server=http.createServer(async(req,res)=>{
   if(req.url==='/login'&&dashboardAuth.valid(req)){res.writeHead(302,{Location:'/','Cache-Control':'no-store'});return res.end();}
   const page=fs.readFileSync(path.join(ROOT,'public',req.url==='/'?'index.html':'signin.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','content-length':page.length,'content-security-policy':"default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",'x-content-type-options':'nosniff','cache-control':'no-store'});return res.end(page);
  }
- if (req.method==='GET' && ['/app.js','/account-view.js','/style.css','/signin.js','/signin.css'].includes(req.url)) {const b=fs.readFileSync(path.join(ROOT,'public',req.url.slice(1)));res.writeHead(200,{'content-type':req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8','content-length':b.length,'x-content-type-options':'nosniff'});return res.end(b);}
+ if (req.method==='GET' && ['/app.js','/account-view.js','/mailbox-view.js','/style.css','/signin.js','/signin.css'].includes(req.url)) {const b=fs.readFileSync(path.join(ROOT,'public',req.url.slice(1)));res.writeHead(200,{'content-type':req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8','content-length':b.length,'x-content-type-options':'nosniff'});return res.end(b);}
  if(req.url.startsWith('/api/'))return management(req,res);
  if (!authorized(req)) { req.resume(); return fail(res,401,'Invalid API key.','authentication_error'); }
  if (req.method==='GET' && req.url==='/v1/models') {

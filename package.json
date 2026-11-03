@@ -1,1 +1,1 @@
-{"name":"ufo-openai-adapter","version":"1.0.0","private":true,"engines":{"node":">=20.18.1"},"scripts":{"start":"node server.js","test":"node --test test/*.test.js"},"dependencies":{"ajv":"^8.20.0","undici":"^7.0.0"}}
+{"name":"ufo-openai-adapter","version":"1.0.0","private":true,"engines":{"node":">=20.18.1"},"scripts":{"start":"node server.js","test":"node --test test/*.test.js"},"dependencies":{"ajv":"^8.20.0","imapflow":"^2.0.6","postal-mime":"^2.7.6","undici":"^7.0.0"}}
