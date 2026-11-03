@@ -116,7 +116,7 @@ async function management(req,res) {
  if(req.method!=='GET'&&req.headers['x-ufo-ui']!=='1')return fail(res,403,'无效的管理请求。');
  if(req.method==='GET' && req.url==='/api/accounts')return json(res,200,accounts.list());
  if(req.method==='GET' && req.url==='/api/mailboxes')return json(res,200,{mailboxes:mailboxes.list()});
- if(req.method==='GET' && req.url==='/api/mailboxes/jobs')return json(res,200,{jobs:mailboxJobs.list()});
+ if(req.method==='GET' && req.url==='/api/mailboxes/jobs')return json(res,200,{jobs:mailboxJobs.list(),concurrency:pool.settings().registration_concurrency});
  if(req.method==='GET' && req.url==='/api/activity')return json(res,200,{calls:activity.recent()});
  if(req.method==='GET' && req.url==='/api/settings'){res.setHeader('Cache-Control','no-store');return json(res,200,{...pool.settings(),apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
  if(req.method==='GET' && req.url==='/api/quotas')return json(res,200,{accounts:await pool.quotaList(false)});
@@ -174,6 +174,7 @@ const server=http.createServer(async(req,res)=>{
   if(req.url==='/login'&&dashboardAuth.valid(req)){res.writeHead(302,{Location:'/','Cache-Control':'no-store'});return res.end();}
   const page=fs.readFileSync(path.join(ROOT,'public',req.url==='/'?'index.html':'signin.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','content-length':page.length,'content-security-policy':"default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",'x-content-type-options':'nosniff','cache-control':'no-store'});return res.end(page);
  }
+ if(req.method==='GET'&&req.url==='/fonts/noto-sans-sc-ui.woff'){const b=fs.readFileSync(path.join(ROOT,'public/fonts/noto-sans-sc-ui.woff'));res.writeHead(200,{'content-type':'font/woff','content-length':b.length,'cache-control':'public, max-age=86400'});return res.end(b);}
  if (req.method==='GET' && ['/app.js','/account-view.js','/mailbox-view.js','/style.css','/signin.js','/signin.css'].includes(req.url)) {const b=fs.readFileSync(path.join(ROOT,'public',req.url.slice(1)));res.writeHead(200,{'content-type':req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8','content-length':b.length,'x-content-type-options':'nosniff'});return res.end(b);}
  if(req.url.startsWith('/api/'))return management(req,res);
  if (!authorized(req)) { req.resume(); return fail(res,401,'Invalid API key.','authentication_error'); }
