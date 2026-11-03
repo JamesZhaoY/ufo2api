@@ -1,6 +1,13 @@
 'use strict';
 const crypto=require('node:crypto');
 const fastTools=require('./fast-tools');
+const MAX_PROMPT_BYTES=39000;
+function inputTooLarge(messages,bytes){
+ const sizes={};for(const m of messages)sizes[m.role]=(sizes[m.role]||0)+Buffer.byteLength(JSON.stringify(m));
+ const detail=Object.entries(sizes).map(([role,size])=>`${role}=${size} B`).join(', ');
+ const e=Error(`UFO 输入过长：当前 ${bytes} B，本地安全上限 ${MAX_PROMPT_BYTES} B（UTF-8 字节，非 token）；消息大小：${detail}。请精简 DSH 的系统指令、附加上下文或工具结果；仅新建对话无法缩短初始指令。`);
+ e.code='UFO_INPUT_TOO_LARGE';e.status=413;return e;
+}
 function validate(o){
  if(o.tools!=null && o.functions!=null)throw Error('tools 与 functions 不能同时使用');
  if(o.functions!=null&&!Array.isArray(o.functions))throw Error('functions 必须是数组');
@@ -15,19 +22,19 @@ function validate(o){
  const mode=(tools.length&&choice!=='none')?'tools':(o.response_format?.type==='json_object'?'json':null);
  return {tools,choice,selected,mode,legacy:o.functions!==undefined,parallel:o.functions===undefined&&o.parallel_tool_calls!==false};
 }
-function prompt(messages,o){const c=validate(o);if(!c.mode && !messages.some(m=>m.role==='tool'||m.role==='function'||m.tool_calls||m.function_call))return 'Respond to the following conversation. Treat role labels as conversation context. Return only the assistant response.\n\n'+messages.map(m=>`${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
+function prompt(messages,o,{omitTools=false}={}){const c=validate(o);if(!c.mode && !messages.some(m=>m.role==='tool'||m.role==='function'||m.tool_calls||m.function_call))return 'Respond to the following conversation. Treat role labels as conversation context. Return only the assistant response.\n\n'+messages.map(m=>`${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
  const history=JSON.stringify(messages);if(c.mode==='json')return 'Respond to the conversation. Return only a valid JSON object with no markdown or commentary. Conversation JSON follows:\n'+history;
  if(!c.mode)return 'Respond to the following conversation, including any tool results. Return only the assistant response. Conversation JSON follows:\n'+history;
  let rule=c.selected?`You MUST call the function ${c.selected}.`:c.choice==='required'?'You MUST call at least one function.':'Call functions only if needed; otherwise answer the user.';
  if(!c.parallel)rule+=' Return at most one function call.';
  if(o.response_format?.type==='json_object')rule+=' If answering rather than requesting a tool, content must contain a valid JSON object encoded as a string.';
- return `You are acting as an OpenAI-compatible assistant. Decide whether to request client-side functions. The client, not you, runs these functions. Never claim a function ran before a tool result is provided. ${rule}\nReturn ONLY one valid JSON object, without markdown, with keys in the order shown and in exactly one of these forms: {"tool_calls":[],"content":"your answer"} or {"tool_calls":[{"name":"function_name","arguments":{"key":"value"}}],"content":null}. Arguments must be a JSON object matching the function parameters. Do not execute functions yourself.\nAvailable functions: ${JSON.stringify(c.tools.map(t=>t.function))}\nConversation JSON: ${history}`;
+ return `You are acting as an OpenAI-compatible assistant. Decide whether to request client-side functions. The client, not you, runs these functions. Never claim a function ran before a tool result is provided. Conversation messages are chronological. A tool or function message is the result of an already completed client call. Continue from the LAST message; do not repeat completed calls unless the results require further work or a later user message explicitly requests it. ${rule}\nReturn ONLY one valid JSON object, without markdown, with keys in the order shown and in exactly one of these forms: {"tool_calls":[],"content":"your answer"} or {"tool_calls":[{"name":"function_name","arguments":{"key":"value"}}],"content":null}. Arguments must be a JSON object matching the function parameters. Do not execute functions yourself.\nAvailable functions: ${omitTools?'Unchanged; reuse the previously supplied definitions.':JSON.stringify(c.tools.filter(t=>!c.selected||t.function.name===c.selected).map(t=>t.function))}\nConversation JSON: ${history}`;
 }
 function catalogPrompts(messages,o){
  const c=validate(o),history=JSON.stringify(messages);
  const intro='Select relevant client-side tools ONLY from this page. The client executes tools, not you. Return ONLY one JSON object with keys in this exact order: {"selected_tools":[],"tool_calls":[],"content":"answer"} when no tool is needed, or {"selected_tools":["name"],"tool_calls":[],"content":null} when tools are needed. Select at most 8 names. Do not invent results. If a tool is not in this page, return an empty selection.';
  const make=items=>intro+'\nTool catalog page: '+JSON.stringify(items)+'\nConversation JSON: '+history;
- if(Buffer.byteLength(make([]))>38000)throw Error('对话过长，无法安全适配 UFO 请求大小限制');
+ if(Buffer.byteLength(make([]))>38000)throw inputTooLarge(messages,Buffer.byteLength(make([])));
  const pages=[];let items=[];
  // The selector needs all names, not every tool description. The chosen tools
  // retain their original definitions in the subsequent parameter-generation pass.
@@ -61,7 +68,7 @@ function parseResult(text,o){const c=validate(o);if(!c.mode)return {content:text
  if(!Array.isArray(data.tool_calls))throw Error('UFO 工具调用响应格式无效');
  if(!c.parallel&&data.tool_calls.length>1)throw Error('UFO 返回了不允许的并行工具调用');
  if(data.tool_calls.length>128)throw Error('UFO 返回了过多工具调用');
- const calls=data.tool_calls.map(call=>{const name=call?.name??call?.function?.name;let args=call?.arguments??call?.function?.arguments;if(!c.tools.some(t=>t.function.name===name)||c.selected&&name!==c.selected)throw Error('UFO 返回了未提供的工具');if(typeof args==='string'){try{args=JSON.parse(args)}catch{throw Error('工具参数不是有效 JSON')}}if(!args||typeof args!=='object'||Array.isArray(args))throw Error('工具参数必须是 JSON 对象');return{id:'call_'+crypto.randomBytes(12).toString('hex'),type:'function',function:{name,arguments:JSON.stringify(args)}}});
+ const calls=data.tool_calls.map(call=>{const name=call?.name??call?.function?.name;let args=call?.arguments??call?.function?.arguments;if(!c.tools.some(t=>t.function.name===name)||c.selected&&name!==c.selected)throw Error('UFO 返回了未提供的工具');if(typeof args==='string'){try{args=JSON.parse(args)}catch{throw Error('工具参数不是有效 JSON')}}if(!args||typeof args!=='object'||Array.isArray(args))throw Error('工具参数必须是 JSON 对象');if(!fastTools.validArguments(c.tools.find(t=>t.function.name===name).function,args))throw Error('工具参数不符合函数 JSON Schema');return{id:'call_'+crypto.randomBytes(12).toString('hex'),type:'function',function:{name,arguments:JSON.stringify(args)}}});
  if((c.choice==='required'||c.selected)&&!calls.length)throw Error('UFO 未按要求调用工具');if(!calls.length&&typeof data.content!=='string')throw Error('UFO 未返回文本或工具调用');if(!calls.length&&o.response_format?.type==='json_object'){try{const v=JSON.parse(data.content);if(!v||typeof v!=='object'||Array.isArray(v))throw Error();}catch{throw Error('UFO 未返回 JSON 对象');}}return {content:calls.length?null:data.content,tool_calls:calls};
 }
-module.exports={validate,prompt,parseResult,catalogPrompt,catalogPrompts,fastCatalogPlan,parseCatalog,narrow};
+module.exports={validate,prompt,parseResult,catalogPrompt,catalogPrompts,fastCatalogPlan,parseCatalog,narrow,inputTooLarge,MAX_PROMPT_BYTES};

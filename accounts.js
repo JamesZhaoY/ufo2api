@@ -14,7 +14,15 @@ function list(){const db=read();return {activeId:db.activeId,accounts:db.account
 function select(id){const db=read();if(!db.accounts.some(a=>a.id===id))throw Error('账号不存在');db.activeId=id;write(db);}
 function setProxy(id,proxy){const db=read(),a=db.accounts.find(a=>a.id===id);if(!a)throw Error('账号不存在');a.proxy=proxyUrl(proxy);write(db);}
 function remove(id){const db=read(),i=db.accounts.findIndex(a=>a.id===id);if(i<0)throw Error('账号不存在');db.accounts.splice(i,1);if(db.activeId===id)db.activeId=db.accounts[0]?.id||null;write(db);}
-function exportAccounts(){const db=read();return {format:'ufo-accounts',version:1,accounts:db.accounts.map(({name,token,workspace,proxy})=>({name,token,workspace,proxy:proxy||''}))};}
+function subset(ids){
+ const all=read().accounts;
+ if(ids===undefined)return all;
+ if(!Array.isArray(ids)||!ids.length||ids.some(id=>typeof id!=='string'||!id))throw Error('请选择至少一个有效账号');
+ const selected=new Set(ids),known=new Set(all.map(a=>a.id));
+ if([...selected].some(id=>!known.has(id)))throw Error('部分选中账号已不存在，请刷新页面后重试');
+ return all.filter(a=>selected.has(a.id));
+}
+function exportAccounts(ids){return {format:'ufo-accounts',version:1,accounts:subset(ids).map(({name,token,workspace,proxy})=>({name,token,workspace,proxy:proxy||''}))};}
 function importAccounts(input){
  if(!input || input.format!=='ufo-accounts' || input.version!==1 || !Array.isArray(input.accounts) || input.accounts.length===0 || input.accounts.length>500)throw Error('无效的 UFO 账号备份，须包含 1–500 个账号');
  const valid=input.accounts.map((item,index)=>{
@@ -31,4 +39,4 @@ function importAccounts(input){
 }
 function dispatcher(proxy){if(!proxy)return undefined;proxy=proxyUrl(proxy);if(!agents.has(proxy))agents.set(proxy,new ProxyAgent(proxy));return agents.get(proxy);}
 function options(proxy){const d=dispatcher(proxy);return d?{dispatcher:d}:{};}
-module.exports={HOME,read,list,active,select,setProxy,remove,saveAccount,proxyUrl,options,exportAccounts,importAccounts};
+module.exports={HOME,read,list,active,select,setProxy,remove,saveAccount,proxyUrl,options,subset,exportAccounts,importAccounts};

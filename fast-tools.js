@@ -1,6 +1,23 @@
 'use strict';
 const Ajv=require('ajv');
 const ajv=new Ajv({strict:true,allowUnionTypes:true,allErrors:false});
+const validators=new Map();
+function validArguments(def,args){
+ if(!args||typeof args!=='object'||Array.isArray(args))return false;
+ if(def.parameters===undefined)return Object.keys(args).length===0;
+ try{
+  const key=JSON.stringify(def.parameters);
+  let validator=validators.get(key);
+  if(!validator){
+   validator=ajv.compile(def.parameters);
+   // Keep Ajv's own cache bounded as well; retained functions remain usable.
+   ajv.removeSchema(def.parameters);
+   if(validators.size>=128)validators.delete(validators.keys().next().value);
+   validators.set(key,validator);
+  }
+  return !validator.$async&&validator(args)===true;
+ }catch{return false;}
+}
 function rankTools(messages,tools){
  const last=[...messages].reverse().find(m=>m.role==='user'&&typeof m.content==='string')?.content.toLowerCase()||'';
  const used=new Set();for(const m of messages)if(m.role==='assistant')for(const call of m.tool_calls||[])if(call.function?.name)used.add(call.function.name);
@@ -15,7 +32,7 @@ function rankTools(messages,tools){
 function validCalls(calls,selected,ready,tools,parallel){
  if(!Array.isArray(calls)||!calls.length||calls.length!==selected.length||(!parallel&&calls.length>1))return false;
  const expected=new Set(selected),seen=new Set(),readySet=new Set(ready);
- for(const call of calls){const name=call?.name??call?.function?.name;if(!expected.has(name)||!readySet.has(name)||seen.has(name))return false;seen.add(name);let args=call?.arguments??call?.function?.arguments;if(typeof args==='string'){try{args=JSON.parse(args)}catch{return false}}if(!args||typeof args!=='object'||Array.isArray(args))return false;const def=tools.find(t=>t.function.name===name)?.function;if(!def||!def.parameters||typeof def.parameters!=='object')return false;try{const validator=ajv.compile(def.parameters);if(validator.$async || validator(args)!==true)return false;}catch{return false;}}
+ for(const call of calls){const name=call?.name??call?.function?.name;if(!expected.has(name)||!readySet.has(name)||seen.has(name))return false;seen.add(name);let args=call?.arguments??call?.function?.arguments;if(typeof args==='string'){try{args=JSON.parse(args)}catch{return false}}if(!args||typeof args!=='object'||Array.isArray(args))return false;const def=tools.find(t=>t.function.name===name)?.function;if(!def||!validArguments(def,args))return false;}
  return seen.size===expected.size;
 }
-module.exports={rankTools,validCalls};
+module.exports={rankTools,validCalls,validArguments};

@@ -9,3 +9,5 @@
 input,textarea,select{font-weight:400}.settings-form textarea{font-size:13px}
 
 .refresh-button{min-width:118px}.refresh-icon{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;font-size:18px;line-height:1;flex:none;transform-origin:center}.refresh-button.is-refreshing{color:var(--accent);border-color:var(--accent);background:var(--tint);opacity:1;cursor:wait}.is-refreshing .refresh-icon{animation:refresh-spin .85s linear infinite}@keyframes refresh-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.is-refreshing .refresh-icon{animation:none}}
+
+.account-selection{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px}.account-selection>span{font-size:12px;color:var(--muted)}.account-choice{display:flex;align-items:center;gap:10px;margin:0;cursor:pointer}.account-choice strong{overflow-wrap:anywhere;min-width:0}

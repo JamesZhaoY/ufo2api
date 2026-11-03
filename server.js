@@ -9,6 +9,9 @@ const login = require('./login');
 const pool = require('./pool');
 const activity = require('./activity');
 const compat = require('./compat');
+const contextCompact = require('./context-compact');
+const webUpstream = require('./web-upstream');
+const webSessions = require('./web-sessions');
 const fastTools = require('./fast-tools');
 const {CatalogTextStream,ToolTextStream}=require('./catalog-stream');
 const auth = require('./auth');
@@ -24,6 +27,12 @@ const PORT = Number(process.env.UFO_PROXY_PORT || 8787);
 const KEY = process.env.UFO_PROXY_API_KEY || '';
 const TIMEOUT = Number(process.env.UFO_TIMEOUT || 600) * 1000;
 const MODEL = 'ufo';
+function trace(event){
+ const line=JSON.stringify({at:new Date().toISOString(),...event})+'\n';
+ console.log(line.trimEnd());
+ try{fs.mkdirSync(HOME,{recursive:true,mode:0o700});const file=path.join(HOME,'request-trace.log');if(fs.existsSync(file)&&fs.statSync(file).size>1024*1024)fs.writeFileSync(file,'',{mode:0o600});fs.appendFileSync(file,line,{mode:0o600});}catch(e){console.error('调用阶段日志写入失败:',e.code);}
+}
+
 const modelInflight = new Map(), pendingLogins = new Map();
 let PUBLIC=null;
 if(process.env.UFO_PUBLIC_ORIGIN){PUBLIC=new URL(process.env.UFO_PUBLIC_ORIGIN);if(!['http:','https:'].includes(PUBLIC.protocol)||PUBLIC.username||PUBLIC.password||PUBLIC.pathname!=='/'||PUBLIC.search||PUBLIC.hash)throw Error('UFO_PUBLIC_ORIGIN 必须是 HTTP(S) origin');}
@@ -51,19 +60,21 @@ async function getModels(account, refresh=false) {
 }
 async function refreshAccount(account){return Promise.allSettled([getModels(account,true),pool.quota(account,true)]);}
 const mailboxJobs=mailboxJobsModule.create({refresh:refreshAccount});
-const quotaRefresh=require('./quota-refresh').create({accounts:()=>accounts.read().accounts,quota:(a,signal)=>pool.quota(a,true,signal)});
+const quotaRefresh=require('./quota-refresh').create({accounts:ids=>accounts.subset(ids),quota:(a,signal)=>pool.quota(a,true,signal)});
 async function warmMissing(){const all=accounts.read().accounts;for(let i=0;i<all.length;i+=8)await Promise.all(all.slice(i,i+8).map(a=>{const jobs=[];if(!stateCache.get(a,'models'))jobs.push(getModels(a,true));if(!stateCache.get(a,'quota'))jobs.push(pool.quota(a,true));return Promise.allSettled(jobs)}));}
-async function upstream(messages, onText, signal, account=readConfig(), model=MODEL, request={}, promptOverride=null) {
+async function upstream(messages, onText, signal, account=readConfig(), model=MODEL, request={}, promptOverride=null, webOptions={}) {
  const {token,workspace:origin,proxy}=account;
  const channel=crypto.randomBytes(16).toString('hex');
  const prompt=promptOverride??compat.prompt(messages,request);
+ if(process.env.UFO_TRANSPORT==='web')return webUpstream.upstream(prompt,onText,signal,account,model,webOptions);
+ if(Buffer.byteLength(prompt)>compat.MAX_PROMPT_BYTES)throw compat.inputTooLarge(messages,Buffer.byteLength(prompt));
  const response=await fetch(`${origin}/surface/ufo/${channel}`,{method:'POST',headers:{
   'authorization':`Bearer ${token}`,'content-type':'text/plain','accept-encoding':'identity',
   'x-ufo-session':`Author.local.${crypto.randomUUID()}`,'x-ufo-tty':'0','x-ufo-installed':'0',
   'x-ufo-script':'0.1.95','x-ufo-timezone':Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC','x-ufo-internet':'off',
   ...(model !== MODEL && model !== 'auto' ? {'x-ufo-model':model}: {})
  },body:prompt,signal,...accounts.options(proxy)});
- if (!response.ok) throw Error(response.status===413?'UFO 上游请求过大，请缩短对话或工具定义':`UFO returned HTTP ${response.status}`);
+ if (!response.ok) {if(response.status===413)throw compat.inputTooLarge(messages,Buffer.byteLength(prompt));throw Error(`UFO returned HTTP ${response.status}`);}
  if (!response.body) throw Error('UFO returned no response stream');
  const decoder=new TextDecoder(); let pending='', text='', terminal=false, escapeTail='';
  const emitText=(raw, final=false)=>{
@@ -128,15 +139,15 @@ async function management(req,res) {
  if(req.method!=='POST')return fail(res,404,'Not found.');
  let raw='',bytes=0;const dec=new StringDecoder('utf8');
  try{
-  for await(const part of req){bytes+=part.length;if(bytes>(['/api/accounts/import','/api/mailboxes/import'].includes(req.url)?2097152:16384))return fail(res,413,'请求过大。');raw+=dec.write(part);}raw+=dec.end();
+  for await(const part of req){bytes+=part.length;if(bytes>(['/api/accounts/import','/api/mailboxes/import','/api/accounts/export','/api/quotas/refresh'].includes(req.url)?2097152:16384))return fail(res,413,'请求过大。');raw+=dec.write(part);}raw+=dec.end();
   const data=JSON.parse(raw||'{}');
-  if(req.url==='/api/quotas/refresh'){if(data.background===true)return json(res,200,{refresh:quotaRefresh.start()});return json(res,200,{accounts:await pool.quotaList(true)});}
+  if(req.url==='/api/quotas/refresh'){if(data.background===true)return json(res,200,{refresh:quotaRefresh.start(data.ids)});return json(res,200,{accounts:await pool.quotaList(true,data.ids)});}
   if(req.url==='/api/models/refresh'){const a=readConfig(),models=await getModels(a,true);return json(res,200,{models,accountId:a.id,updatedAt:stateCache.get(a,'models')?.updatedAt||null});}
   if(req.url==='/api/settings'){if(data.apiKey!==undefined){auth.valid(data.apiKey);if(KEY&&data.apiKey!==KEY)throw Error('API Key 由环境变量控制，请修改环境变量后重启');}const saved=pool.saveSettings(data);mailboxJobs.reconfigure();if(data.apiKey!==undefined&&!KEY&&data.apiKey!==auth.key())auth.set(data.apiKey);return json(res,200,{...saved,apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
   if(req.url==='/api/mailboxes/import'){if(data.replace&&mailboxes.list().some(x=>mailboxJobs.busy(x.id)))throw Error('邮箱注册任务进行中，请完成后替换凭据');return json(res,200,mailboxes.importEntries(data.entries,{replace:data.replace===true}));}
   if(req.url==='/api/mailboxes/register')return json(res,200,{jobs:mailboxJobs.start(data.ids)});
   if(req.url==='/api/mailboxes/delete'){if(mailboxJobs.busy(data.id))throw Error('该邮箱正在注册，暂不能移除');mailboxes.remove(data.id);return json(res,200,{mailboxes:mailboxes.list()});}
-  if(req.url==='/api/accounts/export'){res.setHeader('Cache-Control','no-store');return json(res,200,accounts.exportAccounts());}
+  if(req.url==='/api/accounts/export'){res.setHeader('Cache-Control','no-store');return json(res,200,accounts.exportAccounts(data.ids));}
   if(req.url==='/api/accounts/import'){const result=accounts.importAccounts(data);if(result.imported)void warmMissing().catch(e=>console.error('导入后加载失败:',e.message));return json(res,200,result);}
   if(req.url==='/api/accounts/select'){accounts.select(data.id);return json(res,200,accounts.list());}
   if(req.url==='/api/accounts/proxy'){accounts.setProxy(data.id,data.proxy||'');return json(res,200,accounts.list());}
@@ -189,15 +200,15 @@ const server=http.createServer(async(req,res)=>{
  }
 
  if (req.method!=='POST'||req.url!=='/v1/chat/completions') {req.resume();return fail(res,404,'Not found.');}
- const started=Date.now();let callModel=null,callAccount=null,callAccountName=null,recorded=false;const timings={routingMs:null,quotaMs:null,modelCheckMs:null,catalogMs:null,catalogPages:0,generationMs:null,firstOutputMs:null,toolCount:0};
- const saveCall=(outcome)=>{if(recorded)return;recorded=true;activity.record({at:new Date().toISOString(),model:callModel,accountId:callAccount,accountName:callAccountName,outcome,httpStatus:res.headersSent?res.statusCode:null,durationMs:Date.now()-started,timings});};
+ const requestTrace=crypto.randomUUID();const started=Date.now();let callModel=null,callAccount=null,callAccountName=null,recorded=false;const timings={routingMs:null,quotaMs:null,modelCheckMs:null,catalogMs:null,catalogPages:0,generationMs:null,firstOutputMs:null,toolCount:0};
+ const saveCall=(outcome)=>{if(recorded)return;recorded=true;trace({event:'request_finished',request:requestTrace,outcome,status:res.headersSent?res.statusCode:null,durationMs:Date.now()-started,toolDefinitions:timings.toolCount,toolResultsReceived:timings.toolResultsReceived??0,toolCallsReturned:timings.toolCallsReturned??0,finishReason:timings.finishReason??null,compactionMs:timings.compactionMs??null});activity.record({at:new Date().toISOString(),model:callModel,accountId:callAccount,accountName:callAccountName,outcome,httpStatus:res.headersSent?res.statusCode:null,durationMs:Date.now()-started,timings});};
  res.on('finish',()=>saveCall(res.statusCode>=200&&res.statusCode<300?'success':'failed'));
  res.on('close',()=>{if(!res.writableFinished)saveCall('interrupted')});
  let data='', size=0; const bodyDecoder=new StringDecoder('utf8');
  try {
   for await (const part of req) {size+=part.length;if(size>1048576) {fail(res,413,'Request body too large.');return;}data+=bodyDecoder.write(part);}
   data+=bodyDecoder.end();
-  const body=parseRequest(data),mode=compat.validate(body);callModel=body.model;timings.toolCount=mode.tools.length;let account;const routeStarted=Date.now();
+  const body=parseRequest(data),mode=compat.validate(body),conversationKey=pool.conversationKey(body,req.headers['x-conversation-id']);callModel=body.model;timings.toolCount=mode.tools.length;timings.toolResultsReceived=body.messages.filter(m=>m.role==='tool'||m.role==='function').length;trace({event:'request_started',request:requestTrace,toolDefinitions:timings.toolCount,toolResultsReceived:timings.toolResultsReceived,stream:body.stream===true});let account;const routeStarted=Date.now();
   if(process.env.UFO_TOKEN && process.env.UFO_WORKSPACE_URL){account=readConfig();}
   else {
    const all=accounts.read().accounts;if(!all.length)return fail(res,503,'请先添加 UFO 账号。','api_error');
@@ -208,7 +219,7 @@ const server=http.createServer(async(req,res)=>{
     if(body.model!==MODEL && body.model!=='auto')modelChecks.set(a.id,getModels(a).then(names=>({supported:names.includes(body.model),elapsed:Date.now()-modelStarted}),()=>({supported:false,elapsed:Date.now()-modelStarted})));
     return quotaTask.then(q=>({account:a,quota:q}));
    });candidates.push(...await Promise.all(jobs));}
-   try{const opts=pool.settings();const key=pool.conversationKey(body,req.headers['x-conversation-id']);account=await pool.chooseSupported(candidates,opts,key,async a=>{const task=modelChecks.get(a.id);if(!task)return true;const checked=await task;timings.modelCheckMs=checked.elapsed;return checked.supported;});}catch(e){return fail(res,503,e.message,'api_error');}
+   try{const opts=pool.settings();const key=conversationKey;account=await pool.chooseSupported(candidates,opts,key,async a=>{const task=modelChecks.get(a.id);if(!task)return true;const checked=await task;timings.modelCheckMs=checked.elapsed;return checked.supported;});}catch(e){return fail(res,e.code==='UFO_INSUFFICIENT_QUOTA'?402:503,e.message,e.code==='UFO_INSUFFICIENT_QUOTA'?'insufficient_quota':'api_error');}
   }
   timings.routingMs=Date.now()-routeStarted;callAccount=account.id||null;callAccountName=account.name||null;
   const id='chatcmpl-'+crypto.randomUUID().replaceAll('-',''), created=Math.floor(Date.now()/1000);
@@ -217,9 +228,27 @@ const server=http.createServer(async(req,res)=>{
   const frame=(delta,finish_reason=null)=>({id,object:'chat.completion.chunk',created,model:body.model,choices:[{index:0,delta,finish_reason}]});
   let sent=false,catalogStreamed='',toolStreamed='';
   const emitContent=part=>{if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame({content:part}))+'\n\n');};
+  let webSession=null,completedMessage=null;
   try {
-   let request=body, result;
-   if(mode.mode==='tools' && Buffer.byteLength(compat.prompt(body.messages,body))>39000){
+   timings.transport=process.env.UFO_TRANSPORT==='web'?'web':'cli';
+   if(timings.transport==='cli'&&process.env.UFO_CONTEXT_COMPACT==='1'&&Buffer.byteLength(JSON.stringify(body.messages))>16000){
+    const compactStarted=Date.now();
+    timings.stage='compaction';timings.contextBytesBefore=Buffer.byteLength(JSON.stringify(body.messages));
+    let summary;try{summary=await contextCompact.compact(body.messages,{scope:[account.workspace,account.token,account.proxy,body.model],signal:controller.signal,onProgress:p=>{timings.summaryCalls=p.calls;timings.summaryCompleted=p.completed;timings.summaryCacheHits=p.cacheHits;trace({event:'compaction_progress',request:requestTrace,...p});},summarize:(prompt,signal)=>upstream([],()=>{},signal,account,body.model,{},prompt)});}finally{timings.compactionMs=Date.now()-compactStarted;}
+    body.messages=summary.messages;
+    timings.compactionMs=Date.now()-compactStarted;timings.contextBytesBefore=summary.before;timings.contextBytesAfter=summary.after;
+    res.setHeader('X-UFO-Context-Compacted',String(summary.compressed));
+   }
+   if(timings.transport==='web'){
+    webSession=await webSessions.begin({account,body,conversationKey,signal:controller.signal,onUsage:u=>{if(Number.isFinite(u.tokens))timings.upstreamTokens=u.tokens;if(Number.isFinite(u.costMicroUsd))timings.upstreamCostMicroUsd=u.costMicroUsd;if(Number.isFinite(u.cachePercent))timings.upstreamCachePercent=u.cachePercent;}});
+    const session=webSession;res.once('finish',()=>{if(res.statusCode>=200&&res.statusCode<300&&completedMessage)session.commit(completedMessage);session.release();});res.once('close',()=>session.release());
+    controller.signal.throwIfAborted();
+    res.setHeader('X-UFO-Session-Reused',String(session.reused));res.setHeader('X-UFO-Input-Bytes',String(session.sentBytes));
+    timings.sessionReused=session.reused;timings.upstreamInputBytes=session.sentBytes;timings.fullInputBytes=session.fullBytes;
+    trace({event:'web_context',request:requestTrace,reused:session.reused,sentBytes:session.sentBytes,fullBytes:session.fullBytes});
+   }
+   timings.stage=timings.transport==='web'?'request_preparation':'tool_selection';trace({event:'stage',request:requestTrace,stage:timings.stage});let request=body, result;
+   if(timings.transport==='cli'&&mode.mode==='tools' && Buffer.byteLength(compat.prompt(body.messages,body))>39000){
     if(mode.selected){request=compat.narrow(body,[mode.selected]);}
     else{const pages=compat.fastCatalogPlan(body.messages,body), picks=[];timings.catalogPages=pages.length;const catalogStarted=Date.now();const canStream=body.stream&&pages.length<=3&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';let allReady=false,pendingText='';const readyFlags=pages.map(()=>false);const maybeEmit=()=>{if(!allReady&&readyFlags.every(Boolean)){allReady=true;if(pendingText){catalogStreamed+=pendingText;emitContent(pendingText);pendingText='';}}};const decoders=canStream?pages.map((_,i)=>new CatalogTextStream(part=>{if(i!==0)return;if(!allReady)pendingText+=part;else{catalogStreamed+=part;emitContent(part);}},()=>{readyFlags[i]=true;maybeEmit();})):[];for(let i=0;i<pages.length;i+=3){const slice=pages.slice(i,i+3);const batch=await Promise.all(slice.map((p,j)=>upstream(body.messages,x=>decoders[i+j]?.push(x),controller.signal,account,body.model,body,p.prompt)));picks.push(...batch.map((x,j)=>({...compat.parseCatalog(x,body,{allowEmpty:true}),ready:slice[j].ready})));}
      timings.catalogMs=Date.now()-catalogStarted;
@@ -227,17 +256,18 @@ const server=http.createServer(async(req,res)=>{
      if(selected.length){if(catalogStreamed)throw Error('UFO 工具选择结果与已输出文本不一致');const calls=picks.flatMap(x=>x.rawCalls),ready=picks.flatMap(x=>x.ready);if(fastTools.validCalls(calls,selected,ready,mode.tools,mode.parallel)){result=JSON.stringify({content:null,tool_calls:calls});timings.fastToolCalls=true;}else request=compat.narrow(body,selected);}else{if(mode.choice==='required')throw Error('UFO 未按要求选择工具');const answer=picks.find(x=>typeof x.content==='string')?.content;if(answer===undefined)throw Error('UFO 未返回回复');if(catalogStreamed&&!answer.startsWith(catalogStreamed))throw Error('UFO 回复与已输出文本不一致');result=JSON.stringify({content:answer,tool_calls:[]});}}
 
    }
-   if(result===undefined){const generationStarted=Date.now();const canStreamToolText=body.stream&&mode.mode==='tools'&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';const toolDecoder=canStreamToolText?new ToolTextStream(part=>{toolStreamed+=part;emitContent(part)}):null;try{result=await upstream(body.messages, part=>{
+   if(result===undefined){timings.stage='generation';trace({event:'stage',request:requestTrace,stage:timings.stage});const generationStarted=Date.now();const canStreamToolText=body.stream&&mode.mode==='tools'&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';const toolDecoder=canStreamToolText?new ToolTextStream(part=>{toolStreamed+=part;emitContent(part)}):null;try{result=await upstream(body.messages, part=>{
     if (!body.stream) return;
     if(mode.mode){toolDecoder?.push(part);return;}
     emitContent(part);
-   },controller.signal,account,body.model,request);}finally{timings.generationMs=Date.now()-generationStarted;}}
-   const parsed=compat.parseResult(result,request);
+   },controller.signal,account,body.model,request,webSession?.prompt??null,webSession?.transport??{});}finally{timings.generationMs=Date.now()-generationStarted;}}
+   timings.stage='response_validation';const parsed=compat.parseResult(result,request);
    if(toolStreamed&&(parsed.tool_calls.length||typeof parsed.content!=='string'||!parsed.content.startsWith(toolStreamed)))throw Error('UFO 回复与已输出文本不一致');
    const calls=parsed.tool_calls, legacy=mode.legacy&&calls.length>0;
    const message={role:'assistant',content:parsed.content};
    if(calls.length){if(legacy)message.function_call=calls[0].function;else message.tool_calls=calls;}
-   const finish=calls.length?(legacy?'function_call':'tool_calls'):'stop';
+   completedMessage=message;
+   const finish=calls.length?(legacy?'function_call':'tool_calls'):'stop';timings.toolCallsReturned=calls.length;timings.finishReason=finish;
    if (body.stream) {
     if(catalogStreamed&&parsed.content?.length>catalogStreamed.length)emitContent(parsed.content.slice(catalogStreamed.length));
     if(toolStreamed&&parsed.content?.length>toolStreamed.length)emitContent(parsed.content.slice(toolStreamed.length));
@@ -247,10 +277,11 @@ const server=http.createServer(async(req,res)=>{
    } else {timings.firstOutputMs=Date.now()-started;json(res,200,{id,object:'chat.completion',created,model:body.model,choices:[{index:0,message,finish_reason:finish}],usage:null});}
   } catch(e) {
    controller.abort();
+   if(e.code==='UFO_INSUFFICIENT_QUOTA'&&account.id){pool.freeze(account);timings.accountFrozen=true;trace({event:'account_frozen',request:requestTrace,reason:'insufficient_quota'});}
    console.error('UFO request failed:',e.message);
-   if (!res.headersSent) fail(res,e.code==='UFO_MODEL_REFUSAL'?422:502,'UFO request failed: '+(e.name==='AbortError'?'timeout or disconnected':e.message),e.code==='UFO_MODEL_REFUSAL'?'invalid_request_error':'api_error');
+   if (!res.headersSent) fail(res,e.code==='UFO_INSUFFICIENT_QUOTA'?402:e.code==='UFO_PARKED'?422:e.code==='UFO_CONTEXT_TIMEOUT'?504:e.code==='UFO_INPUT_TOO_LARGE'?413:e.code==='UFO_MODEL_REFUSAL'?422:502,'UFO request failed: '+(e.name==='AbortError'?'timeout or disconnected':e.message),e.code==='UFO_INSUFFICIENT_QUOTA'?'insufficient_quota':['UFO_MODEL_REFUSAL','UFO_INPUT_TOO_LARGE','UFO_PARKED'].includes(e.code)?'invalid_request_error':'api_error');
    else res.destroy();
-  } finally {clearTimeout(timer);}
+  } finally {clearTimeout(timer);if(res.destroyed)webSession?.release();}
  } catch(e) {if(!res.headersSent)fail(res,400,e.message);else res.destroy();}
 });
 if (require.main===module){dashboardAuth.password();auth.key();server.listen(PORT,HOST,()=>{console.log(`UFO adapter listening at http://${HOST}:${PORT}/v1`);warmMissing().catch(e=>console.error('初次加载账号状态失败:',e.message));});}

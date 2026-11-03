@@ -8,9 +8,9 @@ test('strategies prefer usable quota, rotate and never treat unknown as zero',()
  opts.strategy='round_robin';assert.deepEqual(Array.from({length:4},()=>pool.choose([a,b,zero],opts,null).id),['a','b','a','b']);
  opts.strategy='random';for(let i=0;i<100;i++)assert.notEqual(pool.choose([a,b,zero],opts,null).id,'zero');
 });
-test('sticky mapping survives strategy changes and never silently reassigns exhausted account',()=>{
+test('sticky mapping survives strategy changes and moves away from exhausted account',()=>{
  const opt={strategy:'round_robin',sticky:true,sticky_minutes:1},key='explicit:test-sticky';let x=pool.choose([a,b],opt,key,1000);assert.equal(pool.choose([a,b],{...opt,strategy:'quota'},key,2000).id,x.id);
- assert.throws(()=>pool.choose([{...a,quota:{status:'exhausted'}},b],opt,key,3000),/不可用/);
+ assert.equal(pool.choose([{...a,quota:{status:'exhausted'}},b],opt,key,3000).id,'b');
  assert.equal(pool.choose([a,b],{...opt,strategy:'quota'},key,64001).id,'b');
 });
 test('conversation IDs and settings are validated',()=>{
@@ -27,3 +27,8 @@ test('concurrent requests with same session share a single sticky choice',async(
 });
 test('registration settings validate and preserve old configurations',()=>{const old={strategy:'round_robin',sticky:false,sticky_minutes:60};fs.writeFileSync(path.join(tmp,'settings.json'),JSON.stringify(old));assert.equal(pool.settings().registration_concurrency,2);const saved=pool.saveSettings({...old,registration_concurrency:5,proxy_sources:[],registration_proxies:['http://127.0.0.1:8080']});assert.equal(saved.registration_concurrency,5);assert.deepEqual(pool.settings().registration_proxies,['http://127.0.0.1:8080/']);assert.equal(pool.saveSettings(old).registration_concurrency,5);assert.throws(()=>pool.saveSettings({...old,registration_concurrency:0}),/并发/);assert.throws(()=>pool.saveSettings({...old,proxy_sources:[],registration_proxies:[]}),/至少/);});
 test('registration batch limit defaults to 50 and is persisted with bounds',()=>{const old={strategy:'round_robin',sticky:true,sticky_minutes:60};fs.writeFileSync(path.join(tmp,'settings.json'),JSON.stringify(old));assert.equal(pool.settings().registration_batch_limit,50);pool.saveSettings({...old,registration_batch_limit:300});assert.equal(pool.settings().registration_batch_limit,300);assert.equal(pool.saveSettings(old).registration_batch_limit,300);for(const limit of [0,501,1.5,'50'])assert.throws(()=>pool.saveSettings({...old,registration_batch_limit:limit}),/上限/);});
+test('failover skips unsupported alternatives after an exhausted sticky binding',async()=>{
+ const opts={strategy:'quota',sticky:true,sticky_minutes:5},key='explicit:failover-support',first=candidate('fa','available',100),second=candidate('fb','available',20),third=candidate('fc','available',10);
+ assert.equal((await pool.chooseSupported([first,second,third],opts,key,async()=>true)).id,'fa');
+ const next=await pool.chooseSupported([{...first,quota:{status:'exhausted'}},second,third],opts,key,async account=>account.id==='fc');assert.equal(next.id,'fc');
+});
