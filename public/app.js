@@ -116,3 +116,14 @@ function resetImportPreview(){importPreview=null;$('#mailbox-preview').hidden=tr
 $('#mailbox-import-text').oninput=resetImportPreview;$('#mailbox-replace').onchange=resetImportPreview;
 function previewImport(){const report=MailboxView.inspectMailboxText($('#mailbox-import-text').value);const box=$('#mailbox-preview');box.replaceChildren();box.hidden=false;box.append(el('strong','',`${report.entries.length} 行有效 · ${report.errors.length} 行错误`));if(report.errors.length){const list=el('ul');for(const error of report.errors)list.append(el('li','',error));box.append(list);return;}const existing=report.entries.filter(e=>mailboxRows.some(m=>m.email.toLowerCase()===e.email.toLowerCase())).length;box.append(el('p','',`${existing} 个邮箱已存在，将${$('#mailbox-replace').checked?'替换授权':'跳过'}。密码字段不会上传。`));importPreview=report;$('#mailbox-import-submit').textContent='确认导入';}
 $('#copy').onclick=$('#overview-copy').onclick=()=>copyText(location.origin+'/v1','接口地址已复制');$('#copy-key').onclick=()=>copyText($('#api-key').value,'API Key 已复制');
+
+// Only deliberate navigation resets the list; polling and selection keep its position.
+for(const [prefix,search,controls,buttons] of [
+ ['account','account-search',['account-status','account-sort','account-page-size'],['account-prev','account-next']],
+ ['mailbox','mailbox-search',['mailbox-status','mailbox-page-size'],['mailbox-prev','mailbox-next','mailbox-clear-filter']]
+]){
+ const reset=()=>{$('#'+prefix+'-viewport').scrollTop=0;};
+ $('#'+search).addEventListener('input',reset);
+ for(const id of controls)$('#'+id).addEventListener('change',reset);
+ for(const id of buttons)$('#'+id).addEventListener('click',reset);
+}
