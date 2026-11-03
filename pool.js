@@ -3,26 +3,27 @@ const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypt
 const accounts=require('./accounts');
 const stateCache=require('./state-cache');
 const SETTINGS=path.join(accounts.HOME,'settings.json');
-const defaults={strategy:'round_robin',sticky:true,sticky_minutes:60,registration_concurrency:2,proxy_sources:['http://104.234.174.66:7778/api/proxies'],registration_proxies:[]};
+const defaults={strategy:'round_robin',sticky:true,sticky_minutes:60,registration_concurrency:2,registration_batch_limit:50,proxy_sources:['http://104.234.174.66:7778/api/proxies'],registration_proxies:[]};
 const strategies=new Set(['quota','random','round_robin']);
 const quotaInflight=new Map(),stickyMap=new Map(),sessionLocks=new Map();let cursor=0;
 function settings(){if(!fs.existsSync(SETTINGS))return {...defaults};const x=JSON.parse(fs.readFileSync(SETTINGS,'utf8'));return normalize(x);}
 function normalize(x){
  if(!x||!strategies.has(x.strategy)||typeof x.sticky!=='boolean'||!Number.isInteger(x.sticky_minutes)||x.sticky_minutes<1||x.sticky_minutes>1440)throw Error('无效的账号池设置');
- const concurrency=x.registration_concurrency??defaults.registration_concurrency,sources=x.proxy_sources??defaults.proxy_sources,proxies=x.registration_proxies??defaults.registration_proxies;
+ const batchLimit=x.registration_batch_limit??defaults.registration_batch_limit,concurrency=x.registration_concurrency??defaults.registration_concurrency,sources=x.proxy_sources??defaults.proxy_sources,proxies=x.registration_proxies??defaults.registration_proxies;
+ if(!Number.isInteger(batchLimit)||batchLimit<1||batchLimit>500)throw Error('每批注册上限须为 1–500');
  if(!Number.isInteger(concurrency)||concurrency<1||concurrency>20)throw Error('注册并发数量须为 1–20');
  if(!Array.isArray(sources)||sources.length>5||sources.some(v=>typeof v!=='string'||v.length>2048))throw Error('代理池接口最多 5 个');
  const checkedSources=sources.map(v=>{let u;try{u=new URL(v)}catch{throw Error('代理池接口地址无效')}if(!['http:','https:'].includes(u.protocol)||u.username||u.password||u.hash)throw Error('代理池接口须为 HTTP(S) 地址且不含用户名、密码或片段');return u.href});
  if(!Array.isArray(proxies)||proxies.length>100||proxies.some(v=>typeof v!=='string'||v.length>2048))throw Error('手动代理最多 100 个');
  const checkedProxies=proxies.map(v=>{const p=accounts.proxyUrl(v);if(!p)throw Error('代理地址不能为空');return p});
  if(!checkedSources.length&&!checkedProxies.length)throw Error('请至少配置一个代理池接口或手动代理');
- return {strategy:x.strategy,sticky:x.sticky,sticky_minutes:x.sticky_minutes,registration_concurrency:concurrency,proxy_sources:[...new Set(checkedSources)],registration_proxies:[...new Set(checkedProxies)]};
+ return {strategy:x.strategy,sticky:x.sticky,sticky_minutes:x.sticky_minutes,registration_concurrency:concurrency,registration_batch_limit:batchLimit,proxy_sources:[...new Set(checkedSources)],registration_proxies:[...new Set(checkedProxies)]};
 }
 function saveSettings(x){const s=normalize({...settings(),...x});fs.mkdirSync(accounts.HOME,{recursive:true,mode:0o700});const tmp=path.join(accounts.HOME,'.settings-'+crypto.randomUUID());try{fs.writeFileSync(tmp,JSON.stringify(s,null,2)+'\n',{mode:0o600,flag:'wx'});fs.renameSync(tmp,SETTINGS);}finally{try{fs.unlinkSync(tmp)}catch{}}if(!s.sticky)stickyMap.clear();return s;}
-async function quota(account,refresh=false){
- const key=account.id+':'+stateCache.fingerprint(account);const saved=stateCache.get(account,'quota');if(!refresh){if(!saved&&quotaInflight.has(key))return quotaInflight.get(key);return saved||{status:'unknown',balance_micro_usd:null,refused_below_micro_usd:null,checkedAt:null,error:'尚未获取，请手动刷新'};}
+async function quota(account,refresh=false,signal){
+ const key=account.id+':'+stateCache.fingerprint(account);const saved=stateCache.get(account,'quota');if(!refresh){return saved||{status:'unknown',balance_micro_usd:null,refused_below_micro_usd:null,checkedAt:null,error:'尚未获取，请手动刷新'};}
  if(quotaInflight.has(key))return quotaInflight.get(key);
- const promise=(async()=>{let q;try{const r=await fetch(account.workspace+'/ext/metronome/billing',{headers:{cookie:'ufo_session='+account.token,accept:'application/json'},...accounts.options(account.proxy),signal:AbortSignal.timeout(30000)});if(!r.ok)throw Error('HTTP '+r.status);const b=await r.json();if(typeof b.limited!=='boolean')throw Error('额度响应格式异常');
+ const promise=(async()=>{let q;try{const r=await fetch(account.workspace+'/ext/metronome/billing',{headers:{cookie:'ufo_session='+account.token,accept:'application/json'},...accounts.options(account.proxy),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(30000)]):AbortSignal.timeout(30000)});if(!r.ok)throw Error('HTTP '+r.status);const b=await r.json();if(typeof b.limited!=='boolean')throw Error('额度响应格式异常');
   if(b.limited && (!Number.isFinite(b.balance_micro_usd)||!Number.isFinite(b.refused_below_micro_usd)))throw Error('额度数据不完整');
   q={status:b.limited?(b.balance_micro_usd<=b.refused_below_micro_usd?'exhausted':'available'):'no_limit',balance_micro_usd:Number.isFinite(b.balance_micro_usd)?b.balance_micro_usd:null,refused_below_micro_usd:Number.isFinite(b.refused_below_micro_usd)?b.refused_below_micro_usd:null,checkedAt:Date.now()};
  }catch(e){const reason=e.name==='TimeoutError'?'查询超时':e.message;q=saved?{...saved,refreshError:reason}:{status:'unknown',balance_micro_usd:null,refused_below_micro_usd:null,checkedAt:null,error:reason};}stateCache.put(account,'quota',q);return q;})().finally(()=>quotaInflight.delete(key));quotaInflight.set(key,promise);return promise;

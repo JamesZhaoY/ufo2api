@@ -51,6 +51,7 @@ async function getModels(account, refresh=false) {
 }
 async function refreshAccount(account){return Promise.allSettled([getModels(account,true),pool.quota(account,true)]);}
 const mailboxJobs=mailboxJobsModule.create({refresh:refreshAccount});
+const quotaRefresh=require('./quota-refresh').create({accounts:()=>accounts.read().accounts,quota:(a,signal)=>pool.quota(a,true,signal)});
 async function warmMissing(){const all=accounts.read().accounts;for(let i=0;i<all.length;i+=8)await Promise.all(all.slice(i,i+8).map(a=>{const jobs=[];if(!stateCache.get(a,'models'))jobs.push(getModels(a,true));if(!stateCache.get(a,'quota'))jobs.push(pool.quota(a,true));return Promise.allSettled(jobs)}));}
 async function upstream(messages, onText, signal, account=readConfig(), model=MODEL, request={}, promptOverride=null) {
  const {token,workspace:origin,proxy}=account;
@@ -116,9 +117,10 @@ async function management(req,res) {
  if(req.method!=='GET'&&req.headers['x-ufo-ui']!=='1')return fail(res,403,'无效的管理请求。');
  if(req.method==='GET' && req.url==='/api/accounts')return json(res,200,accounts.list());
  if(req.method==='GET' && req.url==='/api/mailboxes')return json(res,200,{mailboxes:mailboxes.list()});
- if(req.method==='GET' && req.url==='/api/mailboxes/jobs')return json(res,200,{jobs:mailboxJobs.list(),concurrency:pool.settings().registration_concurrency});
+ if(req.method==='GET' && req.url==='/api/mailboxes/jobs')return json(res,200,{jobs:mailboxJobs.list(),concurrency:pool.settings().registration_concurrency,batchLimit:pool.settings().registration_batch_limit});
  if(req.method==='GET' && req.url==='/api/activity')return json(res,200,{calls:activity.recent()});
  if(req.method==='GET' && req.url==='/api/settings'){res.setHeader('Cache-Control','no-store');return json(res,200,{...pool.settings(),apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
+ if(req.method==='GET' && req.url==='/api/quotas/refresh-status')return json(res,200,{refresh:quotaRefresh.status(),accounts:await pool.quotaList(false)});
  if(req.method==='GET' && req.url==='/api/quotas')return json(res,200,{accounts:await pool.quotaList(false)});
  if(req.method==='GET' && req.url==='/api/models'){
   try{const a=readConfig();const models=await getModels(a,false);return json(res,200,{models,accountId:a.id,updatedAt:stateCache.get(a,'models')?.updatedAt||null});}catch(e){return fail(res,502,e.message,'api_error');}
@@ -128,7 +130,7 @@ async function management(req,res) {
  try{
   for await(const part of req){bytes+=part.length;if(bytes>(['/api/accounts/import','/api/mailboxes/import'].includes(req.url)?2097152:16384))return fail(res,413,'请求过大。');raw+=dec.write(part);}raw+=dec.end();
   const data=JSON.parse(raw||'{}');
-  if(req.url==='/api/quotas/refresh')return json(res,200,{accounts:await pool.quotaList(true)});
+  if(req.url==='/api/quotas/refresh'){if(data.background===true)return json(res,200,{refresh:quotaRefresh.start()});return json(res,200,{accounts:await pool.quotaList(true)});}
   if(req.url==='/api/models/refresh'){const a=readConfig(),models=await getModels(a,true);return json(res,200,{models,accountId:a.id,updatedAt:stateCache.get(a,'models')?.updatedAt||null});}
   if(req.url==='/api/settings'){if(data.apiKey!==undefined){auth.valid(data.apiKey);if(KEY&&data.apiKey!==KEY)throw Error('API Key 由环境变量控制，请修改环境变量后重启');}const saved=pool.saveSettings(data);mailboxJobs.reconfigure();if(data.apiKey!==undefined&&!KEY&&data.apiKey!==auth.key())auth.set(data.apiKey);return json(res,200,{...saved,apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
   if(req.url==='/api/mailboxes/import'){if(data.replace&&mailboxes.list().some(x=>mailboxJobs.busy(x.id)))throw Error('邮箱注册任务进行中，请完成后替换凭据');return json(res,200,mailboxes.importEntries(data.entries,{replace:data.replace===true}));}
