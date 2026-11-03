@@ -166,3 +166,9 @@ Windows PowerShell 启动：`$env:UFO_CONTEXT_COMPACT='1'; npm start`。Docker �
 缓存仅保存上游会话 ID、消息哈希和过期时间，不落盘；最多 128 个会话，空闲 60 分钟到期，超过 2048 条历史消息不缓存。服务重启后首次请求发送全文。账号额度耗尽切换到其他账号时，首次也会重新发送全文。设置 `UFO_WEB_SESSION_CACHE=0` 可禁用增量模式。
 
 响应头 `X-UFO-Session-Reused` 和 `X-UFO-Input-Bytes` 表示是否复用及本轮发送字节。最近调用 timings 包含 `sessionReused`、`upstreamInputBytes`、`fullInputBytes`，以及上游提供时的 `upstreamTokens`、`upstreamCostMicroUsd`、`upstreamCachePercent`。这些是发送量和上游报告值，不承诺固定收费折扣；最终费用以 UFO 账单为准。
+
+### 工具调用首字延迟
+
+流式请求中，符合 `tool_calls → name → arguments` 顺序的首个工具调用会逐步返回名称和参数，不再等整段长代码生成后才开始输出。参数外层的最后一个右括号、其他工具调用及完成标记，仍等全部响应通过工具名称/JSON Schema 校验后发送；上游失败或校验失败会中断流，不发送 `finish_reason: tool_calls` 或 `[DONE]`。客户端应等待流完整结束后执行工具。混杂说明、未知格式和旧版 `functions` 接口继续使用完整校验后的返回方式。
+
+最近调用的「阶段耗时」分别记录网页助手准备、上游提交、建立响应流、上游首字及客户端首字。上游首字从生成阶段起计时，客户端首字从本地收到请求起计时，实际包含文本或工具数据；不会用空帧或心跳充当首字。此优化降低长工具参数的等待，不改变上游模型本身的排队和推理时间。

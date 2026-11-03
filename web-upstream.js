@@ -3,6 +3,8 @@ const crypto=require('node:crypto');
 const accounts=require('./accounts');
 const agents=new Map();
 async function upstream(prompt,onText,signal,account,model='ufo',session={}){
+ const started=Date.now();let firstText=false;
+ const emit=part=>{if(part&&!firstText){firstText=true;session.onTiming?.('upstreamFirstTextMs',Date.now()-started);}onText(part);};
  const base=account.workspace+'/surface/web';
  const headers={cookie:'ufo_session='+account.token,origin:account.workspace,'x-ufo-timezone':'Asia/Shanghai','x-ufo-internet':'off'};
  const options=accounts.options(account.proxy);
@@ -15,23 +17,28 @@ async function upstream(prompt,onText,signal,account,model='ufo',session={}){
   if(!chat)throw Error('UFO 工作区没有可用的 chat 助手');
   agent={id:chat.id,expires:Date.now()+600000};if(agents.size>=128)agents.delete(agents.keys().next().value);agents.set(key,agent);
  }
+ session.onTiming?.('agentLookupMs',Date.now()-started);
  const url=base+'/agents/'+encodeURIComponent(agent.id)+'/chat?conversation='+encodeURIComponent(session.conversationId||'new');
  const files=session.attachments||[];let body=prompt;
  if(files.length){body=new FormData();body.set('message',prompt);for(const file of files)body.append('file',new Blob([file.bytes],{type:file.mime}),file.name);}
+ const submitStarted=Date.now();
  const response=await request(url,{method:'POST',headers:{...(!files.length?{'content-type':'text/plain; charset=utf-8'}:{}),...(!['ufo','auto'].includes(model)?{'x-ufo-model':model}:{})},body});
  if(!response.ok){const e=Error('UFO 网页请求失败 (HTTP '+response.status+')');if(response.status===413)e.code='UFO_INPUT_TOO_LARGE';throw e;}
  const accepted=await response.json();if(typeof accepted.turn_id!=='string'||typeof accepted.conversation_id!=='string')throw Error('UFO 网页返回了无效的会话标识');
+ session.onTiming?.('upstreamSubmitMs',Date.now()-submitStarted);
  session.onAccepted?.(accepted);
  let terminal=false,text='';
  try{
+  const streamStarted=Date.now();
   const stream=await request(base+'/turns/'+encodeURIComponent(accepted.turn_id)+'/stream');
   if(!stream.ok||!stream.body)throw Error('UFO 网页响应流不可用 (HTTP '+stream.status+')');
+  session.onTiming?.('upstreamStreamOpenMs',Date.now()-streamStarted);
   const decoder=new TextDecoder();let pending='',event='message',data=[];
   const dispatch=()=>{
    const kind=event,raw=data.join('\n');event='message';data=[];
    if(!raw||!['message','terminal','parked'].includes(kind))return;
    let value;try{value=JSON.parse(raw);}catch{throw Error('UFO 网页响应事件格式无效');}
-   if(kind==='message'&&typeof value.text==='string'){text+=value.text;onText(value.text);}
+   if(kind==='message'&&typeof value.text==='string'){text+=value.text;emit(value.text);}
    if(kind==='parked'){
     const reason=typeof value.message==='string'?value.message.slice(0,800):'上游未提供原因';
     const exhausted=/\bout of credit\b|\binsufficient credits?\b/i.test(reason);
@@ -42,7 +49,7 @@ async function upstream(prompt,onText,signal,account,model='ufo',session={}){
     terminal=true;
     if(value.status!=='done'||value.error_class||value.incomplete_reason||value.question||value.credential_request||value.connect_request){const e=Error(value.error_class==='ModelRefusal'?'UFO 模型拒绝了该请求':'UFO 网页请求未成功完成');if(value.error_class==='ModelRefusal')e.code='UFO_MODEL_REFUSAL';throw e;}
     session.onUsage?.({tokens:value.tokens,costMicroUsd:value.cost_micro_usd,cachePercent:value.cache_percent});
-    if(!text&&typeof value.text==='string'){text=value.text;onText(text);}
+    if(!text&&typeof value.text==='string'){text=value.text;emit(text);}
    }
   };
   const line=value=>{value=value.replace(/\r$/,'');if(!value){dispatch();return;}if(value.startsWith('event:'))event=value.slice(6).trimStart();if(value.startsWith('data:'))data.push(value.slice(5).replace(/^ /,''));};

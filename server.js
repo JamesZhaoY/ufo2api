@@ -15,6 +15,7 @@ const webSessions = require('./web-sessions');
 const messageContent = require('./message-content');
 const fastTools = require('./fast-tools');
 const {CatalogTextStream,ToolTextStream}=require('./catalog-stream');
+const {ToolCallStream}=require('./tool-call-stream');
 const auth = require('./auth');
 const stateCache = require('./state-cache');
 const dashboardAuth = require('./dashboard-auth');
@@ -229,8 +230,9 @@ const server=http.createServer(async(req,res)=>{
   res.on('close',()=>{if(!res.writableFinished)controller.abort();});
   const frame=(delta,finish_reason=null)=>({id,object:'chat.completion.chunk',created,model:body.model,choices:[{index:0,delta,finish_reason}]});
   let sent=false,catalogStreamed='',toolStreamed='';
-  const emitContent=part=>{if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame({content:part}))+'\n\n');};
-  let webSession=null,completedMessage=null;
+  const emitDelta=delta=>{if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame(delta))+'\n\n');};
+  const emitContent=part=>emitDelta({content:part});
+  let webSession=null,completedMessage=null,callStream=null;
   try {
    timings.transport=process.env.UFO_TRANSPORT==='web'?'web':'cli';
    if(timings.transport==='cli'&&process.env.UFO_CONTEXT_COMPACT==='1'&&Buffer.byteLength(JSON.stringify(body.messages))>16000){
@@ -243,7 +245,7 @@ const server=http.createServer(async(req,res)=>{
    }
    if(timings.transport==='web'){
     webSession=await webSessions.begin({account,body,conversationKey,signal:controller.signal,onUsage:u=>{if(Number.isFinite(u.tokens))timings.upstreamTokens=u.tokens;if(Number.isFinite(u.costMicroUsd))timings.upstreamCostMicroUsd=u.costMicroUsd;if(Number.isFinite(u.cachePercent))timings.upstreamCachePercent=u.cachePercent;}});
-    const session=webSession;res.once('finish',()=>{if(res.statusCode>=200&&res.statusCode<300&&completedMessage)session.commit(completedMessage);session.release();});res.once('close',()=>session.release());
+    const session=webSession;session.transport.onTiming=(key,ms)=>{timings[key]=ms;};res.once('finish',()=>{if(res.statusCode>=200&&res.statusCode<300&&completedMessage)session.commit(completedMessage);session.release();});res.once('close',()=>session.release());
     controller.signal.throwIfAborted();
     res.setHeader('X-UFO-Session-Reused',String(session.reused));res.setHeader('X-UFO-Input-Bytes',String(session.sentBytes));
     timings.attachmentCount=session.transport.attachments.length;timings.sessionReused=session.reused;timings.upstreamInputBytes=session.sentBytes;timings.fullInputBytes=session.fullBytes;
@@ -258,19 +260,21 @@ const server=http.createServer(async(req,res)=>{
      if(selected.length){if(catalogStreamed)throw Error('UFO 工具选择结果与已输出文本不一致');const calls=picks.flatMap(x=>x.rawCalls),ready=picks.flatMap(x=>x.ready);if(fastTools.validCalls(calls,selected,ready,mode.tools,mode.parallel)){result=JSON.stringify({content:null,tool_calls:calls});timings.fastToolCalls=true;}else request=compat.narrow(body,selected);}else{if(mode.choice==='required')throw Error('UFO 未按要求选择工具');const answer=picks.find(x=>typeof x.content==='string')?.content;if(answer===undefined)throw Error('UFO 未返回回复');if(catalogStreamed&&!answer.startsWith(catalogStreamed))throw Error('UFO 回复与已输出文本不一致');result=JSON.stringify({content:answer,tool_calls:[]});}}
 
    }
-   if(result===undefined){timings.stage='generation';trace({event:'stage',request:requestTrace,stage:timings.stage});const generationStarted=Date.now();const canStreamToolText=body.stream&&mode.mode==='tools'&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';const toolDecoder=canStreamToolText?new ToolTextStream(part=>{toolStreamed+=part;emitContent(part)}):null;try{result=await upstream(body.messages, part=>{
+   if(result===undefined){timings.stage='generation';trace({event:'stage',request:requestTrace,stage:timings.stage});const generationStarted=Date.now();if(body.stream&&mode.mode==='tools'&&!mode.legacy)callStream=new ToolCallStream(delta=>{timings.toolStreamed=true;emitDelta({tool_calls:[delta]});},{tools:mode.tools,selected:mode.selected});const canStreamToolText=body.stream&&mode.mode==='tools'&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';const toolDecoder=canStreamToolText?new ToolTextStream(part=>{toolStreamed+=part;emitContent(part)}):null;try{result=await upstream(body.messages, part=>{
     if (!body.stream) return;
-    if(mode.mode){toolDecoder?.push(part);return;}
+    if(mode.mode){toolDecoder?.push(part);callStream?.push(part);return;}
     emitContent(part);
    },controller.signal,account,body.model,request,webSession?.prompt??null,webSession?.transport??{});}finally{timings.generationMs=Date.now()-generationStarted;}}
    timings.stage='response_validation';const parsed=compat.parseResult(result,request);
    if(toolStreamed&&(parsed.tool_calls.length||typeof parsed.content!=='string'||!parsed.content.startsWith(toolStreamed)))throw Error('UFO 回复与已输出文本不一致');
+   callStream?.verify(parsed.tool_calls);if(callStream?.started)parsed.tool_calls[0].id=callStream.id;
    const calls=parsed.tool_calls, legacy=mode.legacy&&calls.length>0;
    const message={role:'assistant',content:parsed.content};
    if(calls.length){if(legacy)message.function_call=calls[0].function;else message.tool_calls=calls;}
    completedMessage=message;
    const finish=calls.length?(legacy?'function_call':'tool_calls'):'stop';timings.toolCallsReturned=calls.length;timings.finishReason=finish;
    if (body.stream) {
+    if(callStream?.started){emitDelta({tool_calls:[{index:0,function:{arguments:'}'}}]});if(calls.length>1)emitDelta({tool_calls:calls.slice(1).map((call,index)=>({index:index+1,...call}))});}
     if(catalogStreamed&&parsed.content?.length>catalogStreamed.length)emitContent(parsed.content.slice(catalogStreamed.length));
     if(toolStreamed&&parsed.content?.length>toolStreamed.length)emitContent(parsed.content.slice(toolStreamed.length));
     if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;

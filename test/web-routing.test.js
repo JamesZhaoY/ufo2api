@@ -50,3 +50,24 @@ test('mixed prose and JSON reaches clients as real tool calls in streaming and n
   else{const choice=JSON.parse(result.text).choices[0];assert.equal(choice.finish_reason,'tool_calls');assert.equal(choice.message.content,null);assert.equal(choice.message.tool_calls[0].function.name,'ask_user_question');assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments),args);}
  }}finally{global.fetch=original;await new Promise(r=>server.close(r));}
 });
+
+test('tool delta arrives while upstream is still generating; invalid calls never finish',async()=>{
+ const original=global.fetch;await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ try{for(const valid of [true,false]){
+  let release,seen;const gate=new Promise(r=>release=r),first=new Promise(r=>seen=r);let output='',ended=false;
+  global.fetch=async(url,o)=>{
+   if(url.endsWith('/api/agents'))return Response.json({agents:[{id:'chat',name:'chat'}]});
+   if(url.includes('/chat?'))return Response.json({conversation_id:'early-'+valid,turn_id:'t'});
+   const prefix='{"tool_calls":[{"name":"write_file","arguments":{"content":'+(valid?'"first':'42');
+   return new Response(new ReadableStream({start(c){const send=s=>c.enqueue(new TextEncoder().encode(s));send('data: '+JSON.stringify({text:prefix})+'\n\n');gate.then(()=>{send('data: '+JSON.stringify({text:(valid?' second"':'')+'}}],"content":null}'})+'\n\nevent: terminal\ndata: {"status":"done"}\n\n');c.close();});}}));
+  };
+  const done=new Promise(resolve=>{const req=http.request({host:'127.0.0.1',port:server.address().port,path:'/v1/chat/completions',method:'POST',headers:{authorization:'Bearer test','content-type':'application/json'}},res=>{res.on('data',chunk=>{output+=chunk;for(const line of output.split('\n'))if(line.startsWith('data: {')){try{const frame=JSON.parse(line.slice(6));if(frame.choices[0].delta.tool_calls)seen(true);}catch{}}});const finish=()=>{ended=true;resolve();};res.on('end',finish);res.on('aborted',finish);res.on('error',finish);});req.on('error',resolve);req.end(JSON.stringify({model:'ufo',stream:true,messages:[{role:'user',content:'Write a file '+valid}],tools:[{type:'function',function:{name:'write_file',parameters:{type:'object',properties:{content:{type:'string'}},required:['content']}}}]}));});
+  let timer;try{
+   assert.equal(await Promise.race([first,new Promise(r=>timer=setTimeout(()=>r(false),750))]),true,'tool data must reach the client before releasing the upstream gate');
+   assert.equal(ended,false);assert(!output.includes('[DONE]'));assert(!output.includes('"finish_reason":"tool_calls"'));
+   release();await done;
+   if(valid){assert(output.includes('"finish_reason":"tool_calls"'));assert(output.includes('[DONE]'));const frames=output.split('\n').filter(x=>x.startsWith('data: {')).map(x=>JSON.parse(x.slice(6)));const args=frames.flatMap(x=>x.choices[0].delta.tool_calls||[]).map(x=>x.function?.arguments||'').join('');assert.deepEqual(JSON.parse(args),{content:'first second'});}
+   else{assert(!output.includes('[DONE]'));assert(!output.includes('"finish_reason":"tool_calls"'));}
+  }finally{clearTimeout(timer);release();await done;}
+ }}finally{global.fetch=original;await new Promise(r=>server.close(r));}
+});
