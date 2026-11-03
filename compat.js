@@ -61,7 +61,25 @@ function parseCatalog(text,o,{allowEmpty=false}={}){
  return {content:null,selected,rawCalls:Array.isArray(data.tool_calls)?data.tool_calls:[]};
 }
 function narrow(o,names){const c=validate(o);const filtered=c.tools.filter(t=>names.includes(t.function.name));if(c.legacy){return {...o,functions:filtered.map(t=>t.function)};}return {...o,tools:filtered};}
-function parseResult(text,o){const c=validate(o);if(!c.mode)return {content:text,tool_calls:[]};let raw=text.trim();if(raw.startsWith('```'))raw=raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');let data;try{data=JSON.parse(raw)}catch{if(c.mode==='tools'&&c.choice==='auto'&&!c.selected&&o.response_format?.type!=='json_object'&&!raw.startsWith('{')&&!raw.startsWith('['))return {content:text,tool_calls:[]};throw Error('UFO 未返回有效的结构化响应');}
+// Some upstream models prepend a short plan to the tool envelope. Recover only
+// one complete trailing envelope, never fenced/quoted examples or arbitrary JSON.
+function mixedToolEnvelope(raw){
+ const start=raw.indexOf('{');if(start<=0)return null;
+ const prefix=raw.slice(0,start),tail=raw.slice(start);
+ if(/```|^\s*>|\b(?:example|sample|format|do not execute|do not run)\b|示例|例如|比如|格式|不要执行/iu.test(prefix))return null;
+ if(!/^\{\s*"(?:tool_calls|content)"\s*:/.test(tail))return null;
+ let data;try{data=JSON.parse(tail);}catch{throw Error('UFO 未返回有效的结构化响应');}
+ if(!data||!Object.hasOwn(data,'tool_calls'))return null;
+ if(Object.keys(data).some(key=>!['tool_calls','content'].includes(key)))throw Error('UFO 工具调用响应格式无效');
+ return data;
+}
+function parseResult(text,o){
+ const c=validate(o);if(!c.mode)return {content:text,tool_calls:[]};
+ let raw=text.trim();if(raw.startsWith('```'))raw=raw.replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
+ let data;try{data=JSON.parse(raw);}catch{
+  data=c.mode==='tools'?mixedToolEnvelope(raw):null;
+  if(data===null){if(c.mode==='tools'&&c.choice==='auto'&&!c.selected&&o.response_format?.type!=='json_object'&&!raw.startsWith('{')&&!raw.startsWith('['))return {content:text,tool_calls:[]};throw Error('UFO 未返回有效的结构化响应');}
+ }
  if(c.mode==='json'){if(!data||Array.isArray(data)||typeof data!=='object')throw Error('UFO 未返回 JSON 对象');return {content:JSON.stringify(data),tool_calls:[]};}
  if(!data||typeof data!=='object'||Array.isArray(data))throw Error('UFO 工具调用响应格式无效');
  if(data.tool_calls===undefined&&typeof data.content==='string')data.tool_calls=[];

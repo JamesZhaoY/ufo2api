@@ -1,6 +1,21 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),compat=require('../compat');
 const tool={type:'function',function:{name:'get_weather',description:'weather',parameters:{type:'object',properties:{city:{type:'string'}},required:['city']}}};
+
+test('prose followed by a tool-call envelope still produces an executable call',()=>{
+ const ask={type:'function',function:{name:'ask_user_question',parameters:{type:'object',properties:{questions:{type:'array',items:{type:'object',properties:{id:{type:'string'},question:{type:'string'}},required:['id','question']}}},required:['questions']}}};
+ const text='我先看一下本机当前安装的版本和可用的更新渠道，再直接帮你完成更新。'+JSON.stringify({tool_calls:[{name:'ask_user_question',arguments:{questions:[{id:'err_detail',question:'报错的具体内容是什么？'}]}}]});
+ const parsed=compat.parseResult(text,{tools:[ask]});assert.equal(parsed.tool_calls.length,1);assert.equal(parsed.tool_calls[0].function.name,'ask_user_question');assert.equal(parsed.content,null);
+});
+
+test('mixed tool responses keep schema validation and do not execute quoted examples',()=>{
+ const envelope=JSON.stringify({tool_calls:[{name:'get_weather',arguments:{city:'Paris'}}]});
+ for(const prefix of ['示例：','For example: ','The JSON format is: ','> ','示例代码：\n```json\n']){const text=prefix+envelope;assert.equal(compat.parseResult(text,{tools:[tool]}).tool_calls.length,0);}
+ assert.throws(()=>compat.parseResult('我来查询。'+JSON.stringify({tool_calls:[{name:'get_weather',arguments:{city:42}}]}),{tools:[tool]}),/JSON Schema/);
+ assert.throws(()=>compat.parseResult('我来调用。'+JSON.stringify({tool_calls:[{name:'unknown',arguments:{}}]}),{tools:[tool]}),/未提供/);
+ assert.throws(()=>compat.parseResult('我来查询。'+envelope+' trailing text',{tools:[tool]}),/结构化/);
+ assert.throws(()=>compat.parseResult('我来查询。'+envelope,{tools:[tool],response_format:{type:'json_object'},tool_choice:'none'}),/结构化/);
+});
 test('function calls are converted into OpenAI tool calls',()=>{let x=compat.parseResult('{"content":null,"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}',{tools:[tool],tool_choice:'required'});assert.equal(x.content,null);assert.equal(x.tool_calls[0].function.name,'get_weather');assert.deepEqual(JSON.parse(x.tool_calls[0].function.arguments),{city:'Paris'});assert.match(x.tool_calls[0].id,/^call_/);});
 test('validate tool choice and reject malformed outputs',()=>{assert.throws(()=>compat.parseResult('plain text',{tools:[tool],tool_choice:'required'}),/结构化/);assert.throws(()=>compat.parseResult('{"content":"x","tool_calls":[]}',{tools:[tool],tool_choice:'required'}),/未按要求/);assert.throws(()=>compat.parseResult('{"content":null,"tool_calls":[{"name":"unknown","arguments":{}}]}',{tools:[tool]}),/未提供/);assert.throws(()=>compat.validate({tools:[tool],tool_choice:{type:'function',function:{name:'bad'}}}));});
 test('tool results and JSON mode stay explicit in the upstream prompt',()=>{let o={tools:[tool]},messages=[{role:'assistant',content:null,tool_calls:[{id:'call_1',type:'function',function:{name:'get_weather',arguments:'{"city":"Paris"}'}}]},{role:'tool',tool_call_id:'call_1',content:'sunny'}];assert.match(compat.prompt(messages,o),/sunny/);assert.equal(compat.parseResult('{"answer":3}',{response_format:{type:'json_object'}}).content,'{"answer":3}');});

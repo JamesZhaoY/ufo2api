@@ -33,3 +33,20 @@ test('screenshot tool result continues over HTTP with an image attachment and la
   const bad=await post({model:'ufo',messages:[{role:'user',content:[{type:'input_audio',input_audio:{data:'PRIVATE'}}]}]});assert.equal(bad.status,400);assert.equal(JSON.parse(bad.text).error.param,'messages[0].content');assert.equal(JSON.parse(bad.text).error.code,'unsupported_message_content');assert(!bad.text.includes('PRIVATE'));
  }finally{global.fetch=original;await new Promise(r=>server.close(r));}
 });
+
+test('mixed prose and JSON reaches clients as real tool calls in streaming and non-streaming responses',async()=>{
+ const original=global.fetch;
+ const args={questions:[{id:'err_detail',question:'报错的具体内容是什么？',header:'报错信息',options:[{label:'应用内更新报错',description:'点击更新后失败'}]}]};
+ const text='我先看一下本机当前安装的版本和可用的更新渠道，再直接帮你完成更新。'+JSON.stringify({tool_calls:[{name:'ask_user_question',arguments:args}]});
+ global.fetch=async(url,o)=>{
+  if(url.endsWith('/api/agents'))return Response.json({agents:[{id:'chat',name:'chat'}]});
+  if(url.includes('/chat?'))return Response.json({conversation_id:'mixed-chat',turn_id:'t'});
+  let events='';for(let i=0;i<text.length;i+=7)events+='data: '+JSON.stringify({text:text.slice(i,i+7)})+'\n\n';return new Response(events+'event: terminal\ndata: {"status":"done"}\n\n');
+ };
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ try{for(const stream of [false,true]){
+  const result=await post({model:'ufo',stream,messages:[{role:'user',content:'Diagnose update error '+stream}],tools:[{type:'function',function:{name:'ask_user_question',parameters:{type:'object',properties:{questions:{type:'array',items:{type:'object'}}},required:['questions']}}}]});assert.equal(result.status,200,result.text);
+  if(stream){const frames=result.text.split('\n').filter(line=>line.startsWith('data: {')).map(line=>JSON.parse(line.slice(6)));assert.equal(frames.at(-1).choices[0].finish_reason,'tool_calls');const calls=frames.flatMap(frame=>frame.choices[0].delta.tool_calls||[]);assert.equal(calls[0].function.name,'ask_user_question');assert.deepEqual(JSON.parse(calls.map(call=>call.function?.arguments||'').join('')),args);assert(!frames.some(frame=>frame.choices[0].delta.content));}
+  else{const choice=JSON.parse(result.text).choices[0];assert.equal(choice.finish_reason,'tool_calls');assert.equal(choice.message.content,null);assert.equal(choice.message.tool_calls[0].function.name,'ask_user_question');assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments),args);}
+ }}finally{global.fetch=original;await new Promise(r=>server.close(r));}
+});
