@@ -39,3 +39,8 @@ test('reports upstream model refusal distinctly',async()=>{
  process.env.UFO_TOKEN='test-token';process.env.UFO_WORKSPACE_URL='https://example.test';const original=global.fetch;global.fetch=async()=>new Response('frame\tterminal\t{"status":"failed","error_class":"ModelRefusal"}\n');
  try{await assert.rejects(upstream([{role:'user',content:'test'}],()=>{},AbortSignal.timeout(5000)),e=>e.code==='UFO_MODEL_REFUSAL');}finally{global.fetch=original;delete process.env.UFO_TOKEN;delete process.env.UFO_WORKSPACE_URL;}
 });
+test('decodes structured JSON correctly across every backslash chunk boundary',async()=>{
+ process.env.UFO_TOKEN='test-token';process.env.UFO_WORKSPACE_URL='https://example.test';const original=global.fetch;
+ const expected=JSON.stringify({tool_calls:[],content:'line one\nline two "quoted" \\ path'});const wire=expected.replace(/\\/g,'\\\\').replace(/"/g,'\\"');
+ try{for(let i=1;i<wire.length;i++){const frames=[wire.slice(0,i),wire.slice(i)].map(x=>'frame\tmessage\t'+JSON.stringify({text:x})+'\n').join('')+'frame\tterminal\t{"status":"done"}\n';global.fetch=async()=>new Response(frames);const text=await upstream([{role:'user',content:'test'}],()=>{},AbortSignal.timeout(5000));assert.equal(text,expected,`split ${i}`);}}finally{global.fetch=original;delete process.env.UFO_TOKEN;delete process.env.UFO_WORKSPACE_URL;}
+});

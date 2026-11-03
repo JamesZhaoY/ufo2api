@@ -10,7 +10,7 @@ const pool = require('./pool');
 const activity = require('./activity');
 const compat = require('./compat');
 const fastTools = require('./fast-tools');
-const {CatalogTextStream}=require('./catalog-stream');
+const {CatalogTextStream,ToolTextStream}=require('./catalog-stream');
 const auth = require('./auth');
 const stateCache = require('./state-cache');
 const dashboardAuth = require('./dashboard-auth');
@@ -64,7 +64,7 @@ async function upstream(messages, onText, signal, account=readConfig(), model=MO
  const decoder=new TextDecoder(); let pending='', text='', terminal=false, escapeTail='';
  const emitText=(raw, final=false)=>{
   let value=escapeTail+raw; escapeTail='';
-  if (!final && value.endsWith('\\')) { escapeTail='\\'; value=value.slice(0,-1); }
+  if(!final){let n=0;while(n<value.length&&value[value.length-1-n]==='\\')n++;if(n%2===1){escapeTail='\\';value=value.slice(0,-1);}}
   value=value.replace(/\\([nrt\\"])/g,(_,c)=>({'n':'\n','r':'\r','t':'\t','\\':'\\','"':'"'}[c]));
   if(value) {text+=value;onText(value);}
  };
@@ -204,30 +204,33 @@ const server=http.createServer(async(req,res)=>{
   const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),TIMEOUT);
   res.on('close',()=>{if(!res.writableFinished)controller.abort();});
   const frame=(delta,finish_reason=null)=>({id,object:'chat.completion.chunk',created,model:body.model,choices:[{index:0,delta,finish_reason}]});
-  let sent=false,catalogStreamed='';
-  const emitContent=part=>{if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache','connection':'keep-alive'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame({content:part}))+'\n\n');};
+  let sent=false,catalogStreamed='',toolStreamed='';
+  const emitContent=part=>{if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame({content:part}))+'\n\n');};
   try {
    let request=body, result;
    if(mode.mode==='tools' && Buffer.byteLength(compat.prompt(body.messages,body))>39000){
     if(mode.selected){request=compat.narrow(body,[mode.selected]);}
-    else{const pages=compat.fastCatalogPlan(body.messages,body), picks=[];timings.catalogPages=pages.length;const catalogStarted=Date.now();const canStream=body.stream&&pages.length===1&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';const decoder=canStream?new CatalogTextStream(part=>{catalogStreamed+=part;emitContent(part)}):null;for(let i=0;i<pages.length;i+=3){const slice=pages.slice(i,i+3);const batch=await Promise.all(slice.map(p=>upstream(body.messages,x=>decoder?.push(x),controller.signal,account,body.model,body,p.prompt)));picks.push(...batch.map((x,j)=>({...compat.parseCatalog(x,body,{allowEmpty:true}),ready:slice[j].ready})));}
+    else{const pages=compat.fastCatalogPlan(body.messages,body), picks=[];timings.catalogPages=pages.length;const catalogStarted=Date.now();const canStream=body.stream&&pages.length<=3&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';let allReady=false,pendingText='';const readyFlags=pages.map(()=>false);const maybeEmit=()=>{if(!allReady&&readyFlags.every(Boolean)){allReady=true;if(pendingText){catalogStreamed+=pendingText;emitContent(pendingText);pendingText='';}}};const decoders=canStream?pages.map((_,i)=>new CatalogTextStream(part=>{if(i!==0)return;if(!allReady)pendingText+=part;else{catalogStreamed+=part;emitContent(part);}},()=>{readyFlags[i]=true;maybeEmit();})):[];for(let i=0;i<pages.length;i+=3){const slice=pages.slice(i,i+3);const batch=await Promise.all(slice.map((p,j)=>upstream(body.messages,x=>decoders[i+j]?.push(x),controller.signal,account,body.model,body,p.prompt)));picks.push(...batch.map((x,j)=>({...compat.parseCatalog(x,body,{allowEmpty:true}),ready:slice[j].ready})));}
      timings.catalogMs=Date.now()-catalogStarted;
      const selected=[...new Set(picks.flatMap(x=>x.selected))];if(selected.length>8)throw Error('UFO 选择了过多工具，请缩小请求范围');
      if(selected.length){if(catalogStreamed)throw Error('UFO 工具选择结果与已输出文本不一致');const calls=picks.flatMap(x=>x.rawCalls),ready=picks.flatMap(x=>x.ready);if(fastTools.validCalls(calls,selected,ready,mode.tools,mode.parallel)){result=JSON.stringify({content:null,tool_calls:calls});timings.fastToolCalls=true;}else request=compat.narrow(body,selected);}else{if(mode.choice==='required')throw Error('UFO 未按要求选择工具');const answer=picks.find(x=>typeof x.content==='string')?.content;if(answer===undefined)throw Error('UFO 未返回回复');if(catalogStreamed&&!answer.startsWith(catalogStreamed))throw Error('UFO 回复与已输出文本不一致');result=JSON.stringify({content:answer,tool_calls:[]});}}
 
    }
-   if(result===undefined){const generationStarted=Date.now();try{result=await upstream(body.messages, part=>{
-    if (!body.stream || mode.mode) return;
+   if(result===undefined){const generationStarted=Date.now();const canStreamToolText=body.stream&&mode.mode==='tools'&&mode.choice==='auto'&&!mode.selected&&body.response_format?.type!=='json_object';const toolDecoder=canStreamToolText?new ToolTextStream(part=>{toolStreamed+=part;emitContent(part)}):null;try{result=await upstream(body.messages, part=>{
+    if (!body.stream) return;
+    if(mode.mode){toolDecoder?.push(part);return;}
     emitContent(part);
    },controller.signal,account,body.model,request);}finally{timings.generationMs=Date.now()-generationStarted;}}
    const parsed=compat.parseResult(result,request);
+   if(toolStreamed&&(parsed.tool_calls.length||typeof parsed.content!=='string'||!parsed.content.startsWith(toolStreamed)))throw Error('UFO 回复与已输出文本不一致');
    const calls=parsed.tool_calls, legacy=mode.legacy&&calls.length>0;
    const message={role:'assistant',content:parsed.content};
    if(calls.length){if(legacy)message.function_call=calls[0].function;else message.tool_calls=calls;}
    const finish=calls.length?(legacy?'function_call':'tool_calls'):'stop';
    if (body.stream) {
     if(catalogStreamed&&parsed.content?.length>catalogStreamed.length)emitContent(parsed.content.slice(catalogStreamed.length));
-    if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache','connection':'keep-alive'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;
+    if(toolStreamed&&parsed.content?.length>toolStreamed.length)emitContent(parsed.content.slice(toolStreamed.length));
+    if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;
      const delta=calls.length?(legacy?{function_call:calls[0].function}:{tool_calls:calls.map((x,i)=>({index:i,...x}))}):{content:parsed.content};res.write('data: '+JSON.stringify(frame(delta))+'\n\n');}
     res.write('data: '+JSON.stringify(frame({},finish))+'\n\ndata: [DONE]\n\n');res.end();
    } else {timings.firstOutputMs=Date.now()-started;json(res,200,{id,object:'chat.completion',created,model:body.model,choices:[{index:0,message,finish_reason:finish}],usage:null});}
