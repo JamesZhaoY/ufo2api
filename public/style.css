@@ -7,3 +7,5 @@
 
 .nav.active:hover{background:var(--tint)}
 input,textarea,select{font-weight:400}.settings-form textarea{font-size:13px}
+
+.refresh-button{min-width:118px}.refresh-icon{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;font-size:18px;line-height:1;flex:none;transform-origin:center}.refresh-button.is-refreshing{color:var(--accent);border-color:var(--accent);background:var(--tint);opacity:1;cursor:wait}.is-refreshing .refresh-icon{animation:refresh-spin .85s linear infinite}@keyframes refresh-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.is-refreshing .refresh-icon{animation:none}}
