@@ -12,6 +12,7 @@ const compat = require('./compat');
 const contextCompact = require('./context-compact');
 const webUpstream = require('./web-upstream');
 const webSessions = require('./web-sessions');
+const messageContent = require('./message-content');
 const fastTools = require('./fast-tools');
 const {CatalogTextStream,ToolTextStream}=require('./catalog-stream');
 const auth = require('./auth');
@@ -40,7 +41,7 @@ function allowedUi(req,requireOrigin=false){const host=(req.headers.host||'').to
 function secureCookie(req){return !!PUBLIC&&PUBLIC.protocol==='https:'&&(req.headers.host||'').toLowerCase()===PUBLIC.host.toLowerCase();}
 
 function json(res, status, obj) { const b = Buffer.from(JSON.stringify(obj)); res.writeHead(status, {'content-type':'application/json; charset=utf-8','content-length':b.length}); res.end(b); }
-function fail(res, status, msg, type='invalid_request_error') { json(res,status,{error:{message:msg,type,param:null,code:null}}); }
+function fail(res, status, msg, type='invalid_request_error',code=null,param=null) { json(res,status,{error:{message:msg,type,param,code}}); }
 function authorized(req) {
  const a=Buffer.from(req.headers.authorization || ''); const b=Buffer.from('Bearer '+auth.key());
  return a.length===b.length && crypto.timingSafeEqual(a,b);
@@ -114,9 +115,9 @@ function parseRequest(body) {
  if (!Array.isArray(o.messages)||!o.messages.length) throw Error('messages must be a non-empty list.');
  for (const m of o.messages) {
   if(!m || !['system','developer','user','assistant','tool','function'].includes(m.role))throw Error('无效的消息角色');
-  if(typeof m.content!=='string' && !(m.role==='assistant'&&m.content==null&&(m.tool_calls||m.function_call)))throw Error('仅支持文本消息和工具调用');
   if(m.role==='tool' && (typeof m.tool_call_id!=='string'||!m.tool_call_id))throw Error('tool 消息缺少 tool_call_id');
  }
+ messageContent.normalize(o.messages);
  compat.validate(o);
  if (o.n!==undefined && o.n!==1) throw Error('Only n=1 is supported.');
  if (o.stream!==undefined && typeof o.stream!=='boolean') throw Error('stream must be a boolean.');
@@ -206,9 +207,10 @@ const server=http.createServer(async(req,res)=>{
  res.on('close',()=>{if(!res.writableFinished)saveCall('interrupted')});
  let data='', size=0; const bodyDecoder=new StringDecoder('utf8');
  try {
-  for await (const part of req) {size+=part.length;if(size>1048576) {fail(res,413,'Request body too large.');return;}data+=bodyDecoder.write(part);}
+   for await (const part of req) {size+=part.length;if(size>32*1024*1024) {fail(res,413,'请求体不能超过 32 MB。');return;}data+=bodyDecoder.write(part);}
   data+=bodyDecoder.end();
   const body=parseRequest(data),mode=compat.validate(body),conversationKey=pool.conversationKey(body,req.headers['x-conversation-id']);callModel=body.model;timings.toolCount=mode.tools.length;timings.toolResultsReceived=body.messages.filter(m=>m.role==='tool'||m.role==='function').length;trace({event:'request_started',request:requestTrace,toolDefinitions:timings.toolCount,toolResultsReceived:timings.toolResultsReceived,stream:body.stream===true});let account;const routeStarted=Date.now();
+  if(process.env.UFO_TRANSPORT!=='web'&&messageContent.attachments(body.messages).length){const e=Error('图片输入需要启用 UFO 网页通道（UFO_TRANSPORT=web）');e.code='unsupported_message_content';e.param='messages';throw e;}
   if(process.env.UFO_TOKEN && process.env.UFO_WORKSPACE_URL){account=readConfig();}
   else {
    const all=accounts.read().accounts;if(!all.length)return fail(res,503,'请先添加 UFO 账号。','api_error');
@@ -244,8 +246,8 @@ const server=http.createServer(async(req,res)=>{
     const session=webSession;res.once('finish',()=>{if(res.statusCode>=200&&res.statusCode<300&&completedMessage)session.commit(completedMessage);session.release();});res.once('close',()=>session.release());
     controller.signal.throwIfAborted();
     res.setHeader('X-UFO-Session-Reused',String(session.reused));res.setHeader('X-UFO-Input-Bytes',String(session.sentBytes));
-    timings.sessionReused=session.reused;timings.upstreamInputBytes=session.sentBytes;timings.fullInputBytes=session.fullBytes;
-    trace({event:'web_context',request:requestTrace,reused:session.reused,sentBytes:session.sentBytes,fullBytes:session.fullBytes});
+    timings.attachmentCount=session.transport.attachments.length;timings.sessionReused=session.reused;timings.upstreamInputBytes=session.sentBytes;timings.fullInputBytes=session.fullBytes;
+    trace({event:'web_context',request:requestTrace,reused:session.reused,sentBytes:session.sentBytes,fullBytes:session.fullBytes,attachments:session.transport.attachments.length});
    }
    timings.stage=timings.transport==='web'?'request_preparation':'tool_selection';trace({event:'stage',request:requestTrace,stage:timings.stage});let request=body, result;
    if(timings.transport==='cli'&&mode.mode==='tools' && Buffer.byteLength(compat.prompt(body.messages,body))>39000){
@@ -282,7 +284,7 @@ const server=http.createServer(async(req,res)=>{
    if (!res.headersSent) fail(res,e.code==='UFO_INSUFFICIENT_QUOTA'?402:e.code==='UFO_PARKED'?422:e.code==='UFO_CONTEXT_TIMEOUT'?504:e.code==='UFO_INPUT_TOO_LARGE'?413:e.code==='UFO_MODEL_REFUSAL'?422:502,'UFO request failed: '+(e.name==='AbortError'?'timeout or disconnected':e.message),e.code==='UFO_INSUFFICIENT_QUOTA'?'insufficient_quota':['UFO_MODEL_REFUSAL','UFO_INPUT_TOO_LARGE','UFO_PARKED'].includes(e.code)?'invalid_request_error':'api_error');
    else res.destroy();
   } finally {clearTimeout(timer);if(res.destroyed)webSession?.release();}
- } catch(e) {if(!res.headersSent)fail(res,400,e.message);else res.destroy();}
+ } catch(e) {trace({event:'request_rejected',request:requestTrace,code:e.code??null,param:e.param??null});if(!res.headersSent)fail(res,400,e.message,'invalid_request_error',e.code??null,e.param??null);else res.destroy();}
 });
 if (require.main===module){dashboardAuth.password();auth.key();server.listen(PORT,HOST,()=>{console.log(`UFO adapter listening at http://${HOST}:${PORT}/v1`);warmMissing().catch(e=>console.error('初次加载账号状态失败:',e.message));});}
 module.exports={server,upstream,parseRequest};

@@ -4,6 +4,19 @@ const assert=require('node:assert/strict');
 const {upstream,parseRequest}=require('../server');
 const {post,parseLogin}=require('../login');
 
+test('normalizes text content parts in client history and tool results',()=>{
+ const body={model:'ufo',messages:[{role:'system',content:[{type:'text',text:'instructions'}]},{role:'user',content:[{type:'text',text:'create '},{type:'text',text:'HTML'}]},{role:'assistant',content:[],tool_calls:[{id:'call_1',type:'function',function:{name:'write_file',arguments:'{}'}}]},{role:'tool',tool_call_id:'call_1',content:[{type:'text',text:'Saved\n'},{type:'text',text:'page.html'}]}]};
+ const parsed=parseRequest(JSON.stringify(body));
+ assert.deepEqual(parsed.messages.map(m=>m.content),['instructions','create HTML','','Saved\npage.html']);
+ assert.equal(parsed.messages[3].tool_call_id,'call_1');assert.equal(parsed.messages[2].tool_calls[0].function.name,'write_file');
+});
+
+test('unsupported or malformed content reports its location without leaking content',()=>{
+ for(const content of [[{type:'image_url',image_url:{url:'data:image/png;base64,PRIVATE'}}],[{type:'text',text:42}],null,{text:'PRIVATE'}]){
+  assert.throws(()=>parseRequest(JSON.stringify({model:'ufo',messages:[{role:'user',content}]})),e=>e.param==='messages[0].content'&&e.code==='unsupported_message_content'&&!e.message.includes('PRIVATE'));
+ }
+});
+
 test('upstream parses fragmented events and decodes line breaks', async()=>{
  process.env.UFO_TOKEN='test-token';process.env.UFO_WORKSPACE_URL='https://example.test';
  const orig=global.fetch;

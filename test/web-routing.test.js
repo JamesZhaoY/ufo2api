@@ -15,3 +15,21 @@ test('web quota exhaustion returns 402 rather than a retryable 502',async()=>{
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
  try{const result=await post({model:'ufo',messages:[{role:'user',content:'hello'}]});assert.equal(result.status,402);assert.equal(JSON.parse(result.text).error.type,'insufficient_quota');assert.equal(stops,1);}finally{global.fetch=original;await new Promise(r=>server.close(r));}
 });
+
+test('screenshot tool result continues over HTTP with an image attachment and later reuses it',async()=>{
+ const original=global.fetch,png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jV1kAAAAASUVORK5CYII=';let chats=0;
+ global.fetch=async(url,o)=>{
+  if(url.endsWith('/api/agents'))return Response.json({agents:[{id:'chat',name:'chat'}]});
+  if(url.includes('/chat?')){chats++;if(chats===2){assert(o.body instanceof FormData);assert.equal(o.headers['content-type'],undefined);assert.match(o.body.get('message'),/Screenshot ready/);assert.deepEqual(Buffer.from(await o.body.get('file').arrayBuffer()),Buffer.from(png,'base64'));assert(url.endsWith('conversation=image-chat'));}else{assert.equal(typeof o.body,'string');if(chats===3){assert(url.endsWith('conversation=image-chat'));assert(!o.body.includes('Attached image:'));}}return Response.json({conversation_id:'image-chat',turn_id:'t'});}
+  const text=JSON.stringify(chats===1?{content:null,tool_calls:[{name:'screenshot',arguments:{}}]}:{content:'Image received',tool_calls:[]});return new Response('event: terminal\ndata: '+JSON.stringify({status:'done',text})+'\n\n');
+ };
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ try{
+  const body={model:'ufo',tools:[{type:'function',function:{name:'screenshot',parameters:{type:'object'}}}],messages:[{role:'user',content:'Preview the animation'}]};
+  const first=await post(body);assert.equal(first.status,200);const reply=JSON.parse(first.text).choices[0].message;
+  const messages=[...body.messages,reply,{role:'tool',tool_call_id:reply.tool_calls[0].id,content:[{type:'text',text:'Screenshot ready'},{type:'image_url',image_url:{url:'data:image/png;base64,'+png}}]}];
+  const second=await post({...body,messages});assert.equal(second.status,200,second.text);assert.equal(second.headers['x-ufo-session-reused'],'true');
+  const third=await post({...body,messages:[...messages,JSON.parse(second.text).choices[0].message,{role:'user',content:[{type:'text',text:'Continue'}]}]});assert.equal(third.status,200);assert.equal(third.headers['x-ufo-session-reused'],'true');assert.equal(chats,3);
+  const bad=await post({model:'ufo',messages:[{role:'user',content:[{type:'input_audio',input_audio:{data:'PRIVATE'}}]}]});assert.equal(bad.status,400);assert.equal(JSON.parse(bad.text).error.param,'messages[0].content');assert.equal(JSON.parse(bad.text).error.code,'unsupported_message_content');assert(!bad.text.includes('PRIVATE'));
+ }finally{global.fetch=original;await new Promise(r=>server.close(r));}
+});

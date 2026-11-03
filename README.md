@@ -40,7 +40,7 @@ PowerShell 启动：`$env:UFO_TRANSPORT='web'; npm start`。Docker 可在 enviro
 
 网页模式默认启用增量会话。首次发送完整历史和工具定义；后续历史严格接续时只发送新增消息/工具结果，不重复发送系统指令与工具定义。工具结果回传时会同步上一轮工具调用的客户端 ID。修改已有历史、重复原请求、切换账号凭据/代理/模型或更改工具配置时，使用新会话发送完整上下文，避免串线。只有本地响应成功发送后才确认缓存；取消、上游失败、格式校验失败后不复用这次会话。每个会话请求串行处理。网页助手本身仍可能使用其工作区能力；提示词要求客户端工具由客户端执行，但这不是上游能力隔离保证。
 
-默认仍保留 CLI 模式；设置 `UFO_TRANSPORT=cli` 可显式选择旧路径。网页路径未套用 CLI 的 39000 字节本地阈值，但仍受上游实际限制和本服务 1 MiB 请求体限制，不能认为上下文无限。工作区需有名为 `chat` 的助手。网页协议同样属于内部接口，可能变化。
+默认仍保留 CLI 模式；设置 `UFO_TRANSPORT=cli` 可显式选择旧路径。网页路径未套用 CLI 的 39000 字节本地阈值，但仍受上游实际限制和本服务 32 MiB 请求体限制，不能认为上下文无限。工作区需有名为 `chat` 的助手。网页协议同样属于内部接口，可能变化。
 
 ## OpenAI 兼容接口
 
@@ -56,13 +56,21 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"gpt-6-luna","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-`stream: true` 支持 SSE 流式输出。文本消息会拼接传给 UFO 助手，角色隔离和行为不等同于原生 OpenAI API；支持通过提示与结果解析适配函数工具调用和 `json_object`；工具由客户端执行。暂不支持图片、JSON Schema 严格约束、多候选和精确 token 统计，采样参数不会传给 UFO。调用可能消耗 UFO 额度。
+`stream: true` 支持 SSE 流式输出。文本消息会拼接传给 UFO 助手，角色隔离和行为不等同于原生 OpenAI API；支持通过提示与结果解析适配函数工具调用和 `json_object`；工具由客户端执行。网页通道支持图片附件；暂不支持 JSON Schema 严格约束、多候选和精确 token 统计，采样参数不会传给 UFO。调用可能消耗 UFO 额度。
 
 默认只监听本机，首次运行会随机生成 API Key，保存在 `.ufo/api-key`（权限 600）。在控制台「系统设置」查看、复制、修改或重新生成；所有 `/v1` 请求都必须携带 `Authorization: Bearer <API Key>`。设置 `UFO_PROXY_API_KEY` 环境变量时，该值优先并锁定页面修改。控制台使用独立的密码登录，不使用 API Key。`UFO_PROXY_HOST`、`UFO_PROXY_PORT`、`UFO_TIMEOUT`（秒）和 `UFO_HOME` 可调整绑定与配置位置。默认只接受本机控制台地址；远程访问需配置 `UFO_PUBLIC_ORIGIN` 和 HTTPS，服务自身不提供 TLS。
 
 UFO 的内部接口并非公开稳定接口，协议变更可能导致模型查询或调用失效。请求关闭 UFO 公共互联网访问，但 UFO 助手仍可能使用工作区工具或请求授权。
 
 测试：`npm test`。
+
+### 截图和图片消息
+
+`messages[].content` 可使用字符串或文本块数组（`{type:"text",text:"..."}`）。网页通道还支持 `image_url` 的 base64 data URL，以及 MCP `image`（`data`/`mimeType`）和 base64 `source` 图片块，可用于用户消息或工具截图结果。图片以网页端相同的 multipart `message`/`file` 方式上传，不会把 base64 塞入提示词或悄悄丢弃图片。
+
+支持 PNG、JPEG、WebP、GIF；单张最多 10 MiB，单次请求最多 32 张、合计 20 MiB 图片，请求体总上限为 32 MiB。远程图片 URL 暂不下载；CLI 模式不支持图片。无效内容返回 400，并在 `error.param` 标明消息位置。图片识别能力仍取决于所选上游模型。
+
+续聊命中缓存时只上传新增消息中的图片；切换会话或账号时重新上传所需历史图片。缓存只保留消息哈希，不保留图片字节。`web_context.attachments` 记录本次附件数量，输入字节数包含图片原始字节（不含 multipart 边界开销），日志不记录图片内容。
 
 ## 批量导入与导出
 

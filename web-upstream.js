@@ -16,7 +16,9 @@ async function upstream(prompt,onText,signal,account,model='ufo',session={}){
   agent={id:chat.id,expires:Date.now()+600000};if(agents.size>=128)agents.delete(agents.keys().next().value);agents.set(key,agent);
  }
  const url=base+'/agents/'+encodeURIComponent(agent.id)+'/chat?conversation='+encodeURIComponent(session.conversationId||'new');
- const response=await request(url,{method:'POST',headers:{'content-type':'text/plain; charset=utf-8',...(!['ufo','auto'].includes(model)?{'x-ufo-model':model}:{})},body:prompt});
+ const files=session.attachments||[];let body=prompt;
+ if(files.length){body=new FormData();body.set('message',prompt);for(const file of files)body.append('file',new Blob([file.bytes],{type:file.mime}),file.name);}
+ const response=await request(url,{method:'POST',headers:{...(!files.length?{'content-type':'text/plain; charset=utf-8'}:{}),...(!['ufo','auto'].includes(model)?{'x-ufo-model':model}:{})},body});
  if(!response.ok){const e=Error('UFO 网页请求失败 (HTTP '+response.status+')');if(response.status===413)e.code='UFO_INPUT_TOO_LARGE';throw e;}
  const accepted=await response.json();if(typeof accepted.turn_id!=='string'||typeof accepted.conversation_id!=='string')throw Error('UFO 网页返回了无效的会话标识');
  session.onAccepted?.(accepted);

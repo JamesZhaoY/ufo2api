@@ -1,6 +1,7 @@
 'use strict';
 const crypto=require('node:crypto');
 const compat=require('./compat');
+const {attachments}=require('./message-content');
 const sessions=new Map(),locks=new Map();
 const TTL=60*60*1000,LIMIT=128;
 function stable(value){
@@ -53,8 +54,9 @@ async function begin({account,body,conversationKey,signal,onUsage=()=>{}}){
   }
   const prompt=reused?'Continue this existing client conversation using the previously supplied instructions and function definitions. The messages below append to that history. If the first entry is an assistant tool call, it only synchronizes client-assigned call IDs for your preceding response; do not execute or repeat it.\n'+compat.prompt(messages,body,{omitTools:true}):compat.prompt(messages,body);
   let conversationId=reused?old.conversationId:null;
-  return {prompt,reused,sentBytes:Buffer.byteLength(prompt),fullBytes:Buffer.byteLength(compat.prompt(body.messages,body)),
-   transport:{conversationId,onAccepted:value=>{conversationId=value.conversation_id;},onUsage},
+  const files=attachments(messages),fileBytes=items=>items.reduce((n,f)=>n+f.bytes.length,0);
+  return {prompt,reused,sentBytes:Buffer.byteLength(prompt)+fileBytes(files),fullBytes:Buffer.byteLength(compat.prompt(body.messages,body))+fileBytes(attachments(body.messages)),
+   transport:{attachments:files,conversationId,onAccepted:value=>{conversationId=value.conversation_id;},onUsage},
    commit(message){
     if(!enabled||signal?.aborted||!conversationId||hashes.length>=2048)return;
     if(sessions.size>=LIMIT)sessions.delete(sessions.keys().next().value);
