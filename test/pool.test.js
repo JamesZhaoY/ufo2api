@@ -14,7 +14,7 @@ test('sticky mapping survives strategy changes and never silently reassigns exha
  assert.equal(pool.choose([a,b],{...opt,strategy:'quota'},key,64001).id,'b');
 });
 test('conversation IDs and settings are validated',()=>{
- const body={messages:[{role:'system',content:'s'},{role:'user',content:'hello'}]};assert.equal(pool.conversationKey(body,'abc'),'explicit:abc');assert.match(pool.conversationKey(body),/^history:/);assert.throws(()=>pool.conversationKey(body,'x'.repeat(257)));assert.throws(()=>pool.saveSettings({strategy:'foo',sticky:true,sticky_minutes:60}));assert.deepEqual(pool.saveSettings({strategy:'random',sticky:true,sticky_minutes:30}),{strategy:'random',sticky:true,sticky_minutes:30});assert.equal(fs.statSync(path.join(tmp,'settings.json')).mode&0o777,0o600);
+ const body={messages:[{role:'system',content:'s'},{role:'user',content:'hello'}]};assert.equal(pool.conversationKey(body,'abc'),'explicit:abc');assert.match(pool.conversationKey(body),/^history:/);assert.throws(()=>pool.conversationKey(body,'x'.repeat(257)));assert.throws(()=>pool.saveSettings({strategy:'foo',sticky:true,sticky_minutes:60}));assert.equal(pool.saveSettings({strategy:'random',sticky:true,sticky_minutes:30}).strategy,'random');assert.equal(fs.statSync(path.join(tmp,'settings.json')).mode&0o777,0o600);
 });
 test.after(()=>fs.rmSync(tmp,{recursive:true,force:true}));
 test('model checks preserve sticky binding and skip unsupported new selections',async()=>{
@@ -25,3 +25,4 @@ test('concurrent requests with same session share a single sticky choice',async(
  const opts={strategy:'round_robin',sticky:true,sticky_minutes:5},key='explicit:concurrent';let release;const gate=new Promise(r=>release=r);
  const one=pool.chooseSupported([a,b],opts,key,async()=>{await gate;return true});const two=pool.chooseSupported([a,b],opts,key,async()=>true);release();const result=await Promise.all([one,two]);assert.equal(result[0].id,result[1].id);
 });
+test('registration settings validate and preserve old configurations',()=>{const old={strategy:'round_robin',sticky:false,sticky_minutes:60};fs.writeFileSync(path.join(tmp,'settings.json'),JSON.stringify(old));assert.equal(pool.settings().registration_concurrency,2);const saved=pool.saveSettings({...old,registration_concurrency:5,proxy_sources:[],registration_proxies:['http://127.0.0.1:8080']});assert.equal(saved.registration_concurrency,5);assert.deepEqual(pool.settings().registration_proxies,['http://127.0.0.1:8080/']);assert.equal(pool.saveSettings(old).registration_concurrency,5);assert.throws(()=>pool.saveSettings({...old,registration_concurrency:0}),/并发/);assert.throws(()=>pool.saveSettings({...old,proxy_sources:[],registration_proxies:[]}),/至少/);});

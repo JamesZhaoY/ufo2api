@@ -130,7 +130,7 @@ async function management(req,res) {
   const data=JSON.parse(raw||'{}');
   if(req.url==='/api/quotas/refresh')return json(res,200,{accounts:await pool.quotaList(true)});
   if(req.url==='/api/models/refresh'){const a=readConfig(),models=await getModels(a,true);return json(res,200,{models,accountId:a.id,updatedAt:stateCache.get(a,'models')?.updatedAt||null});}
-  if(req.url==='/api/settings'){if(data.apiKey!==undefined){auth.valid(data.apiKey);if(KEY&&data.apiKey!==KEY)throw Error('API Key 由环境变量控制，请修改环境变量后重启');}const saved=pool.saveSettings(data);if(data.apiKey!==undefined&&!KEY&&data.apiKey!==auth.key())auth.set(data.apiKey);return json(res,200,{...saved,apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
+  if(req.url==='/api/settings'){if(data.apiKey!==undefined){auth.valid(data.apiKey);if(KEY&&data.apiKey!==KEY)throw Error('API Key 由环境变量控制，请修改环境变量后重启');}const saved=pool.saveSettings(data);mailboxJobs.reconfigure();if(data.apiKey!==undefined&&!KEY&&data.apiKey!==auth.key())auth.set(data.apiKey);return json(res,200,{...saved,apiKey:auth.key(),apiKeySource:KEY?'environment':'local'});}
   if(req.url==='/api/mailboxes/import'){if(data.replace&&mailboxes.list().some(x=>mailboxJobs.busy(x.id)))throw Error('邮箱注册任务进行中，请完成后替换凭据');return json(res,200,mailboxes.importEntries(data.entries,{replace:data.replace===true}));}
   if(req.url==='/api/mailboxes/register')return json(res,200,{jobs:mailboxJobs.start(data.ids)});
   if(req.url==='/api/mailboxes/delete'){if(mailboxJobs.busy(data.id))throw Error('该邮箱正在注册，暂不能移除');mailboxes.remove(data.id);return json(res,200,{mailboxes:mailboxes.list()});}
