@@ -166,7 +166,7 @@ const server=http.createServer(async(req,res)=>{
   if(req.url==='/login'&&dashboardAuth.valid(req)){res.writeHead(302,{Location:'/','Cache-Control':'no-store'});return res.end();}
   const page=fs.readFileSync(path.join(ROOT,'public',req.url==='/'?'index.html':'signin.html'));res.writeHead(200,{'content-type':'text/html; charset=utf-8','content-length':page.length,'content-security-policy':"default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",'x-content-type-options':'nosniff','cache-control':'no-store'});return res.end(page);
  }
- if (req.method==='GET' && ['/app.js','/style.css','/signin.js','/signin.css'].includes(req.url)) {const b=fs.readFileSync(path.join(ROOT,'public',req.url.slice(1)));res.writeHead(200,{'content-type':req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8','content-length':b.length,'x-content-type-options':'nosniff'});return res.end(b);}
+ if (req.method==='GET' && ['/app.js','/account-view.js','/style.css','/signin.js','/signin.css'].includes(req.url)) {const b=fs.readFileSync(path.join(ROOT,'public',req.url.slice(1)));res.writeHead(200,{'content-type':req.url.endsWith('.js')?'text/javascript; charset=utf-8':'text/css; charset=utf-8','content-length':b.length,'x-content-type-options':'nosniff'});return res.end(b);}
  if(req.url.startsWith('/api/'))return management(req,res);
  if (!authorized(req)) { req.resume(); return fail(res,401,'Invalid API key.','authentication_error'); }
  if (req.method==='GET' && req.url==='/v1/models') {
