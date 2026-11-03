@@ -48,6 +48,8 @@ PowerShell 启动：`$env:UFO_TRANSPORT='web'; npm start`。Docker 可在 enviro
 - `GET /v1/models`：返回当前账号保存在本地的模型列表，另外包含兼容旧配置的 `ufo` 别名。
 - `GET /v1/models/{model}`：查询单个模型，带 `/` 的模型 ID 需要 URL 编码。
 - `POST /v1/chat/completions`：`model` 使用返回的模型 ID；`ufo` 和 `auto` 均使用 UFO 自动模型选择。切换模型目录账号后，显示该账号保存的列表。
+- `POST /v1/responses`：OpenAI Responses 格式，支持文本、图片、函数工具及 SSE。
+- `POST /v1/messages`：Anthropic Messages 格式，支持文本、图片、工具及 SSE。
 
 ```sh
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -58,11 +60,34 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 `stream: true` 支持 SSE 流式输出。文本消息会拼接传给 UFO 助手，角色隔离和行为不等同于原生 OpenAI API；支持通过提示与结果解析适配函数工具调用和 `json_object`；工具由客户端执行。网页通道支持图片附件；暂不支持 JSON Schema 严格约束、多候选和精确 token 统计，采样参数不会传给 UFO。调用可能消耗 UFO 额度。
 
-默认只监听本机，首次运行会随机生成 API Key，保存在 `.ufo/api-key`（权限 600）。在控制台「系统设置」查看、复制、修改或重新生成；所有 `/v1` 请求都必须携带 `Authorization: Bearer <API Key>`。设置 `UFO_PROXY_API_KEY` 环境变量时，该值优先并锁定页面修改。控制台使用独立的密码登录，不使用 API Key。`UFO_PROXY_HOST`、`UFO_PROXY_PORT`、`UFO_TIMEOUT`（秒）和 `UFO_HOME` 可调整绑定与配置位置。默认只接受本机控制台地址；远程访问需配置 `UFO_PUBLIC_ORIGIN` 和 HTTPS，服务自身不提供 TLS。
+默认只监听本机，首次运行会随机生成 API Key，保存在 `.ufo/api-key`（权限 600）。在控制台「系统设置」查看、复制、修改或重新生成；所有 `/v1` 请求都必须携带 `Authorization: Bearer <API Key>`，其中 `/v1/messages` 也接受 `x-api-key: <API Key>`。设置 `UFO_PROXY_API_KEY` 环境变量时，该值优先并锁定页面修改。控制台使用独立的密码登录，不使用 API Key。`UFO_PROXY_HOST`、`UFO_PROXY_PORT`、`UFO_TIMEOUT`（秒）和 `UFO_HOME` 可调整绑定与配置位置。默认只接受本机控制台地址；远程访问需配置 `UFO_PUBLIC_ORIGIN` 和 HTTPS，服务自身不提供 TLS。
 
 UFO 的内部接口并非公开稳定接口，协议变更可能导致模型查询或调用失效。请求关闭 UFO 公共互联网访问，但 UFO 助手仍可能使用工作区工具或请求授权。
 
 测试：`npm test`。
+
+### Responses 与 Messages 接入
+
+两种接口都复用账号池、额度冻结、图片上传和 UFO 会话缓存，无须新增账号或 API Key。OpenAI SDK 的 `baseURL` 使用 `http://127.0.0.1:8787/v1`；Anthropic SDK 的 `baseURL` 使用 `http://127.0.0.1:8787`（SDK 自行追加 `/v1/messages`）。
+
+```sh
+curl http://127.0.0.1:8787/v1/responses \
+  -H 'Authorization: Bearer <你的 API Key>' -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-6-astra","input":"你好","stream":true}'
+
+curl http://127.0.0.1:8787/v1/messages \
+  -H 'x-api-key: <你的 API Key>' -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-opus-5-5","max_tokens":1024,"messages":[{"role":"user","content":"你好"}],"stream":true}'
+```
+
+Responses 支持 `instructions`、字符串或消息数组 `input`、`input_text` / `output_text`、base64 data URL `input_image`、扁平 `function` 工具定义、`function_call` / `function_call_output` 和 `tool_choice`。返回原生 `response.*` SSE 事件，包括工具名称与参数增量及 `response.completed`；不混入 Chat Completions 的 `[DONE]`。
+
+续聊可发送完整 `input`，也可传 `previous_response_id` 加本轮新增输入。后者默认仅在进程内保存成功响应的消息历史，最多 128 条、总计 64 MiB、每条 8 MiB、有效期一小时；超出单条限制不缓存，重启或淘汰后返回 404，此时客户端需发送完整历史。`store:false` 禁止保存本次历史。历史按当前 API Key 隔离，不落盘；`instructions` 不从上一响应继承，需要时每轮重发。此历史缓存与仅保存哈希的 UFO 会话增量缓存用途不同。暂不提供 Responses 的 GET/DELETE、后台任务、托管 conversation 或文件 ID 查询接口。
+
+Messages 支持顶层 `system`、`text` / base64 `image`、`tool_use` / `tool_result`（包含截图及 `is_error`）、`input_schema` 工具定义和 `auto` / `any` / `tool` / `none` 选择。返回 `message_start`、`content_block_*`、`message_delta`、`message_stop`；工具参数在完整校验后才结束内容块。`max_tokens` 必须为正整数，但 UFO 内部接口不提供精确输出 token 上限控制。原生 thinking、内置服务端工具、音视频及严格 JSON Schema 输出约束不支持并返回 400；采样、reasoning effort、stop 等生成控制不会透传，不能保证对应行为。Responses `usage` 为 null；Messages 为兼容客户端返回零值 token 占位，均不可当作真实计费统计，实际用量查看控制台上游记录。
+
+事件格式参考 [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses/streaming-events) 和 [Anthropic Messages](https://platform.claude.com/docs/en/build-with-claude/streaming)。这是协议适配，不会改变上游模型的能力或拒绝结果。
 
 ### 截图和图片消息
 

@@ -13,6 +13,7 @@ const contextCompact = require('./context-compact');
 const webUpstream = require('./web-upstream');
 const webSessions = require('./web-sessions');
 const messageContent = require('./message-content');
+const apiFormats = require('./api-formats');
 const fastTools = require('./fast-tools');
 const {CatalogTextStream,ToolTextStream}=require('./catalog-stream');
 const {ToolCallStream}=require('./tool-call-stream');
@@ -42,9 +43,10 @@ function allowedUi(req,requireOrigin=false){const host=(req.headers.host||'').to
 function secureCookie(req){return !!PUBLIC&&PUBLIC.protocol==='https:'&&(req.headers.host||'').toLowerCase()===PUBLIC.host.toLowerCase();}
 
 function json(res, status, obj) { const b = Buffer.from(JSON.stringify(obj)); res.writeHead(status, {'content-type':'application/json; charset=utf-8','content-length':b.length}); res.end(b); }
-function fail(res, status, msg, type='invalid_request_error',code=null,param=null) { json(res,status,{error:{message:msg,type,param,code}}); }
+function fail(res, status, msg, type='invalid_request_error',code=null,param=null) { json(res,status,apiFormats.errorBody(res.apiFormat,status,msg,type,code,param)); }
 function authorized(req) {
- const a=Buffer.from(req.headers.authorization || ''); const b=Buffer.from('Bearer '+auth.key());
+ const value=req.headers.authorization || (req.url?.split('?')[0]==='/v1/messages'&&typeof req.headers['x-api-key']==='string'?'Bearer '+req.headers['x-api-key']:'');
+ const a=Buffer.from(value); const b=Buffer.from('Bearer '+auth.key());
  return a.length===b.length && crypto.timingSafeEqual(a,b);
 }
 function readConfig() {
@@ -110,7 +112,7 @@ async function upstream(messages, onText, signal, account=readConfig(), model=MO
  return text;
 }
 function parseRequest(body) {
- let o; try{o=JSON.parse(body);}catch{throw Error('Invalid JSON.');}
+ let o; try{o=typeof body==='string'?JSON.parse(body):body;}catch{throw Error('Invalid JSON.');}
  if (!o || Array.isArray(o) || typeof o!=='object') throw Error('Request body must be an object.');
  if (typeof o.model!=='string' || !o.model || o.model.length>200 || /[\r\n]/.test(o.model)) throw Error('Invalid model.');
  if (!Array.isArray(o.messages)||!o.messages.length) throw Error('messages must be a non-empty list.');
@@ -176,6 +178,8 @@ async function management(req,res) {
  }catch(e){console.error('Management error:',e.message);return fail(res,400,e.message);}
 }
 const server=http.createServer(async(req,res)=>{
+ const apiPath=req.url.split('?')[0];
+ res.apiFormat=apiPath==='/v1/messages'?'messages':apiPath==='/v1/responses'?'responses':null;
  if(req.url==='/auth/login' && req.method==='POST'){
   if(!allowedUi(req,true)||req.headers['x-ufo-ui']!=='1')return fail(res,403,'来源不匹配。');
   let b='',size=0;try{for await(const chunk of req){size+=chunk.length;if(size>4096)return fail(res,413,'请求过大。');b+=chunk.toString('utf8');}const input=JSON.parse(b);const result=dashboardAuth.authenticate(input.password,req.socket.remoteAddress);if(result.error)return fail(res,result.status,result.error,'authentication_error');res.setHeader('Set-Cookie',dashboardAuth.cookieHeader(result.token,secureCookie(req)));res.setHeader('Cache-Control','no-store');return json(res,200,{ok:true});}catch{return fail(res,400,'登录请求无效。');}
@@ -201,7 +205,7 @@ const server=http.createServer(async(req,res)=>{
   try {const model=decodeURIComponent(req.url.slice('/v1/models/'.length));const names=await getModels(readConfig());if(model!==MODEL && !names.includes(model))return fail(res,404,'模型不存在。');return json(res,200,{id:model,object:'model',created:0,owned_by:'ufo'});}catch(e){return fail(res,502,e.message,'api_error');}
  }
 
- if (req.method!=='POST'||req.url!=='/v1/chat/completions') {req.resume();return fail(res,404,'Not found.');}
+ if (req.method!=='POST'||!['/v1/chat/completions','/v1/responses','/v1/messages'].includes(apiPath)) {req.resume();return fail(res,404,'Not found.');}
  const requestTrace=crypto.randomUUID();const started=Date.now();let callModel=null,callAccount=null,callAccountName=null,recorded=false;const timings={routingMs:null,quotaMs:null,modelCheckMs:null,catalogMs:null,catalogPages:0,generationMs:null,firstOutputMs:null,toolCount:0};
  const saveCall=(outcome)=>{if(recorded)return;recorded=true;trace({event:'request_finished',request:requestTrace,outcome,status:res.headersSent?res.statusCode:null,durationMs:Date.now()-started,toolDefinitions:timings.toolCount,toolResultsReceived:timings.toolResultsReceived??0,toolCallsReturned:timings.toolCallsReturned??0,finishReason:timings.finishReason??null,compactionMs:timings.compactionMs??null});activity.record({at:new Date().toISOString(),model:callModel,accountId:callAccount,accountName:callAccountName,outcome,httpStatus:res.headersSent?res.statusCode:null,durationMs:Date.now()-started,timings});};
  res.on('finish',()=>saveCall(res.statusCode>=200&&res.statusCode<300?'success':'failed'));
@@ -210,7 +214,10 @@ const server=http.createServer(async(req,res)=>{
  try {
    for await (const part of req) {size+=part.length;if(size>32*1024*1024) {fail(res,413,'请求体不能超过 32 MB。');return;}data+=bodyDecoder.write(part);}
   data+=bodyDecoder.end();
-  const body=parseRequest(data),mode=compat.validate(body),conversationKey=pool.conversationKey(body,req.headers['x-conversation-id']);callModel=body.model;timings.toolCount=mode.tools.length;timings.toolResultsReceived=body.messages.filter(m=>m.role==='tool'||m.role==='function').length;trace({event:'request_started',request:requestTrace,toolDefinitions:timings.toolCount,toolResultsReceived:timings.toolResultsReceived,stream:body.stream===true});let account;const routeStarted=Date.now();
+  const decoded=res.apiFormat?apiFormats.decode(data,res.apiFormat,crypto.createHash('sha256').update(auth.key()).digest('hex')):null;
+  const body=parseRequest(decoded?decoded.body:data),mode=compat.validate(body),conversationKey=pool.conversationKey(body,req.headers['x-conversation-id']);
+  const formatReply=res.apiFormat?apiFormats.reply(res.apiFormat,res,body,decoded.context):null;
+  timings.apiFormat=res.apiFormat||'chat';callModel=body.model;timings.toolCount=mode.tools.length;timings.toolResultsReceived=body.messages.filter(m=>m.role==='tool'||m.role==='function').length;trace({event:'request_started',request:requestTrace,apiFormat:timings.apiFormat,toolDefinitions:timings.toolCount,toolResultsReceived:timings.toolResultsReceived,stream:body.stream===true});let account;const routeStarted=Date.now();
   if(process.env.UFO_TRANSPORT!=='web'&&messageContent.attachments(body.messages).length){const e=Error('图片输入需要启用 UFO 网页通道（UFO_TRANSPORT=web）');e.code='unsupported_message_content';e.param='messages';throw e;}
   if(process.env.UFO_TOKEN && process.env.UFO_WORKSPACE_URL){account=readConfig();}
   else {
@@ -230,7 +237,7 @@ const server=http.createServer(async(req,res)=>{
   res.on('close',()=>{if(!res.writableFinished)controller.abort();});
   const frame=(delta,finish_reason=null)=>({id,object:'chat.completion.chunk',created,model:body.model,choices:[{index:0,delta,finish_reason}]});
   let sent=false,catalogStreamed='',toolStreamed='';
-  const emitDelta=delta=>{if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame(delta))+'\n\n');};
+  const emitDelta=delta=>{if(formatReply){if(!sent){timings.firstOutputMs=Date.now()-started;sent=true;}formatReply.delta(delta);return;}if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;}res.write('data: '+JSON.stringify(frame(delta))+'\n\n');};
   const emitContent=part=>emitDelta({content:part});
   let webSession=null,completedMessage=null,callStream=null;
   try {
@@ -277,10 +284,11 @@ const server=http.createServer(async(req,res)=>{
     if(callStream?.started){emitDelta({tool_calls:[{index:0,function:{arguments:callStream.argumentsStarted?'}':calls[0].function.arguments}}]});if(calls.length>1)emitDelta({tool_calls:calls.slice(1).map((call,index)=>({index:index+1,...call}))});}
     if(catalogStreamed&&parsed.content?.length>catalogStreamed.length)emitContent(parsed.content.slice(catalogStreamed.length));
     if(toolStreamed&&parsed.content?.length>toolStreamed.length)emitContent(parsed.content.slice(toolStreamed.length));
+    if(formatReply){if(!sent)emitDelta(calls.length?{tool_calls:calls.map((x,i)=>({index:i,...x}))}:{content:parsed.content});formatReply.finish(message);return;}
     if(!sent){timings.firstOutputMs=Date.now()-started;res.writeHead(200,{'content-type':'text/event-stream; charset=utf-8','cache-control':'no-cache, no-transform','connection':'keep-alive','x-accel-buffering':'no'});res.write('data: '+JSON.stringify(frame({role:'assistant'}))+'\n\n');sent=true;
      const delta=calls.length?(legacy?{function_call:calls[0].function}:{tool_calls:calls.map((x,i)=>({index:i,...x}))}):{content:parsed.content};res.write('data: '+JSON.stringify(frame(delta))+'\n\n');}
     res.write('data: '+JSON.stringify(frame({},finish))+'\n\ndata: [DONE]\n\n');res.end();
-   } else {timings.firstOutputMs=Date.now()-started;json(res,200,{id,object:'chat.completion',created,model:body.model,choices:[{index:0,message,finish_reason:finish}],usage:null});}
+   } else {timings.firstOutputMs=Date.now()-started;if(formatReply)formatReply.finish(message);else json(res,200,{id,object:'chat.completion',created,model:body.model,choices:[{index:0,message,finish_reason:finish}],usage:null});}
   } catch(e) {
    controller.abort();
    if(e.code==='UFO_INSUFFICIENT_QUOTA'&&account.id){pool.freeze(account);timings.accountFrozen=true;trace({event:'account_frozen',request:requestTrace,reason:'insufficient_quota'});}
@@ -288,7 +296,7 @@ const server=http.createServer(async(req,res)=>{
    if (!res.headersSent) fail(res,e.code==='UFO_INSUFFICIENT_QUOTA'?402:e.code==='UFO_PARKED'?422:e.code==='UFO_CONTEXT_TIMEOUT'?504:e.code==='UFO_INPUT_TOO_LARGE'?413:e.code==='UFO_MODEL_REFUSAL'?422:502,'UFO request failed: '+(e.name==='AbortError'?'timeout or disconnected':e.message),e.code==='UFO_INSUFFICIENT_QUOTA'?'insufficient_quota':['UFO_MODEL_REFUSAL','UFO_INPUT_TOO_LARGE','UFO_PARKED'].includes(e.code)?'invalid_request_error':'api_error');
    else res.destroy();
   } finally {clearTimeout(timer);if(res.destroyed)webSession?.release();}
- } catch(e) {trace({event:'request_rejected',request:requestTrace,code:e.code??null,param:e.param??null});if(!res.headersSent)fail(res,400,e.message,'invalid_request_error',e.code??null,e.param??null);else res.destroy();}
+ } catch(e) {trace({event:'request_rejected',request:requestTrace,code:e.code??null,param:e.param??null});if(!res.headersSent)fail(res,e.status||400,e.message,'invalid_request_error',e.code??null,e.param??null);else res.destroy();}
 });
 if (require.main===module){dashboardAuth.password();auth.key();server.listen(PORT,HOST,()=>{console.log(`UFO adapter listening at http://${HOST}:${PORT}/v1`);warmMissing().catch(e=>console.error('初次加载账号状态失败:',e.message));});}
 module.exports={server,upstream,parseRequest};
