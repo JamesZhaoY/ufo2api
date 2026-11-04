@@ -2,10 +2,10 @@
 const crypto=require('node:crypto');
 const fastTools=require('./fast-tools');
 const MAX_PROMPT_BYTES=39000;
-function inputTooLarge(messages,bytes){
+function inputTooLarge(messages,bytes,maxBytes=MAX_PROMPT_BYTES){
  const sizes={};for(const m of messages)sizes[m.role]=(sizes[m.role]||0)+Buffer.byteLength(JSON.stringify(m));
  const detail=Object.entries(sizes).map(([role,size])=>`${role}=${size} B`).join(', ');
- const e=Error(`UFO 输入过长：当前 ${bytes} B，本地安全上限 ${MAX_PROMPT_BYTES} B（UTF-8 字节，非 token）；消息大小：${detail}。请精简 DSH 的系统指令、附加上下文或工具结果；仅新建对话无法缩短初始指令。`);
+ const e=Error(`UFO 输入过长：当前 ${bytes} B，本地安全上限 ${maxBytes} B（UTF-8 字节，非 token）；消息大小：${detail}。请精简 DSH 的系统指令、附加上下文或工具结果；仅新建对话无法缩短初始指令。`);
  e.code='UFO_INPUT_TOO_LARGE';e.status=413;return e;
 }
 function validate(o){
@@ -30,25 +30,25 @@ function prompt(messages,o,{omitTools=false}={}){const c=validate(o);if(!c.mode 
  if(o.response_format?.type==='json_object')rule+=' If answering rather than requesting a tool, content must contain a valid JSON object encoded as a string.';
  return `You are acting as an OpenAI-compatible assistant. Decide whether to request client-side functions. The client, not you, runs these functions. Never claim a function ran before a tool result is provided. Conversation messages are chronological. A tool or function message is the result of an already completed client call. Continue from the LAST message; do not repeat completed calls unless the results require further work or a later user message explicitly requests it. ${rule}\nReturn ONLY one valid JSON object, without markdown, with keys in the order shown and in exactly one of these forms: {"tool_name":null,"tool_calls":[],"content":"your answer"} or {"tool_name":"function_name","tool_calls":[{"name":"function_name","arguments":{"key":"value"}}],"content":null}. Always emit tool_name FIRST, before generating arguments; it must equal the first function name, or null for a text answer. Arguments must be a JSON object matching the function parameters. Do not execute functions yourself.\nAvailable functions: ${omitTools?'Unchanged; reuse the previously supplied definitions.':JSON.stringify(c.tools.filter(t=>!c.selected||t.function.name===c.selected).map(t=>t.function))}\nConversation JSON: ${history}`;
 }
-function catalogPrompts(messages,o){
+function catalogPrompts(messages,o,{maxBytes=MAX_PROMPT_BYTES}={}){
  const c=validate(o),history=JSON.stringify(messages);
  const intro='Select relevant client-side tools ONLY from this page. The client executes tools, not you. Return ONLY one JSON object with keys in this exact order: {"selected_tools":[],"tool_calls":[],"content":"answer"} when no tool is needed, or {"selected_tools":["name"],"tool_calls":[],"content":null} when tools are needed. Select at most 8 names. Do not invent results. If a tool is not in this page, return an empty selection.';
  const make=items=>intro+'\nTool catalog page: '+JSON.stringify(items)+'\nConversation JSON: '+history;
- if(Buffer.byteLength(make([]))>38000)throw inputTooLarge(messages,Buffer.byteLength(make([])));
+ if(Buffer.byteLength(make([]))>maxBytes-1000)throw inputTooLarge(messages,Buffer.byteLength(make([])),maxBytes);
  const pages=[];let items=[];
  // The selector needs all names, not every tool description. The chosen tools
  // retain their original definitions in the subsequent parameter-generation pass.
  for(const t of c.tools){const name=t.function.name;let item=name;
-  if(Buffer.byteLength(make([...items,item]))>39000){if(items.length){pages.push(make(items));items=[];}if(Buffer.byteLength(make([item]))>39000)item=name;if(Buffer.byteLength(make([item]))>39000)throw Error('工具名称无法适配 UFO 请求大小限制');}
+  if(Buffer.byteLength(make([...items,item]))>maxBytes){if(items.length){pages.push(make(items));items=[];}if(Buffer.byteLength(make([item]))>maxBytes)item=name;if(Buffer.byteLength(make([item]))>maxBytes)throw Error('工具名称无法适配 UFO 请求大小限制');}
   items.push(item);
  }
  if(items.length)pages.push(make(items));return pages;
 }
-function fastCatalogPlan(messages,o){
- const c=validate(o),ranked=fastTools.rankTools(messages,c.tools),pages=catalogPrompts(messages,o);
+function fastCatalogPlan(messages,o,{maxBytes=MAX_PROMPT_BYTES}={}){
+ const c=validate(o),ranked=fastTools.rankTools(messages,c.tools),pages=catalogPrompts(messages,o,{maxBytes});
  const instruction='\nFor tools with full definitions below, include their arguments in tool_calls when selected: {"selected_tools":["name"],"tool_calls":[{"name":"name","arguments":{}}],"content":null}. If any selected tool has no full definition, omit tool_calls. If no tool is needed use {"selected_tools":[],"tool_calls":[],"content":"answer"}. Keep keys in this exact order. Return one JSON object only.';
  return pages.map(base=>{const marker='\nTool catalog page: ',start=base.indexOf(marker)+marker.length,end=base.indexOf('\nConversation JSON:',start),names=new Set(JSON.parse(base.slice(start,end)));const ready=[],defs=[];
-  for(const candidate of ranked){const f=candidate.tool.function;if(!names.has(f.name)||ready.length>=4)continue;const next=[...defs,f],suffix=instruction+'\nFull definitions: '+JSON.stringify(next);if(Buffer.byteLength(base+suffix)<=39000){defs.push(f);ready.push(f.name);}}
+  for(const candidate of ranked){const f=candidate.tool.function;if(!names.has(f.name)||ready.length>=4)continue;const next=[...defs,f],suffix=instruction+'\nFull definitions: '+JSON.stringify(next);if(Buffer.byteLength(base+suffix)<=maxBytes){defs.push(f);ready.push(f.name);}}
   return {prompt:ready.length?base+instruction+'\nFull definitions: '+JSON.stringify(defs):base,ready};
  });
 }
