@@ -55,12 +55,12 @@ async function begin({account,body,conversationKey,signal,onUsage=()=>{}}){
   const prompt=reused?'Continue this existing client conversation using the previously supplied instructions and function definitions. The messages below append to that history. If the first entry is an assistant tool call, it only synchronizes client-assigned call IDs for your preceding response; do not execute or repeat it.\n'+compat.prompt(messages,body,{omitTools:true}):compat.prompt(messages,body);
   let conversationId=reused?old.conversationId:null;
   const files=attachments(messages),fileBytes=items=>items.reduce((n,f)=>n+f.bytes.length,0);
-  return {prompt,reused,sentBytes:Buffer.byteLength(prompt)+fileBytes(files),fullBytes:Buffer.byteLength(compat.prompt(body.messages,body))+fileBytes(attachments(body.messages)),
+  return {prompt,reused,messages,catalogSession:reused&&!!old.catalogSession,sentBytes:Buffer.byteLength(prompt)+fileBytes(files),fullBytes:Buffer.byteLength(compat.prompt(body.messages,body))+fileBytes(attachments(body.messages)),
    transport:{attachments:files,conversationId,onAccepted:value=>{conversationId=value.conversation_id;},onUsage},
-   commit(message){
+   commit(message,{catalogSession=false}={}){
     if(!enabled||signal?.aborted||!conversationId||hashes.length>=2048)return;
     if(sessions.size>=LIMIT)sessions.delete(sessions.keys().next().value);
-    sessions.set(key,{conversationId,hashes:[...hashes,messageHash(message)],expires:Date.now()+TTL});
+    sessions.set(key,{conversationId,catalogSession,hashes:[...hashes,messageHash(message)],expires:Date.now()+TTL});
    },release};
  }catch(e){release();throw e;}
 }

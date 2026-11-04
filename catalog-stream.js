@@ -11,4 +11,13 @@ class EmptyToolsTextStream {
 }
 class CatalogTextStream extends EmptyToolsTextStream{constructor(emit,onReady){super(emit,{catalog:true,onReady});}}
 class ToolTextStream extends EmptyToolsTextStream{constructor(emit){super(emit);}}
-module.exports={CatalogTextStream,ToolTextStream};
+// Forward only a single ready tool from an unambiguous catalog prefix. The
+// downstream ToolCallStream withholds completion until full schema validation.
+class CatalogCallStream{
+ constructor(stream,ready){this.stream=stream;this.ready=new Set(ready);this.buffer='';this.started=false;this.disabled=false;}
+ push(chunk){if(this.disabled)return;if(this.started){this.stream.push(chunk);return;}this.buffer+=chunk;
+  const m=/^\s*(?:```(?:json)?[ \t]*\r?\n\s*)?\{\s*"selected_tools"\s*:\s*\[\s*("(?:\\.|[^"\\])*")\s*\]\s*,\s*"tool_calls"\s*:\s*\[/.exec(this.buffer);
+  if(!m){if(this.buffer.length>2048)this.disabled=true;return;}let name;try{name=JSON.parse(m[1])}catch{this.disabled=true;return;}if(!this.ready.has(name)){this.disabled=true;return;}this.started=true;this.stream.selected=name;this.stream.push('{"tool_calls":['+this.buffer.slice(m[0].length));this.buffer='';
+ }
+}
+module.exports={CatalogTextStream,ToolTextStream,CatalogCallStream};
